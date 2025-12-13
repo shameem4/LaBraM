@@ -172,8 +172,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--overwrite",
+        dest="overwrite",
         action="store_true",
-        help="Overwrite the destination file if it already exists",
+        default=True,
+        help="Overwrite the destination file if it already exists (default)",
+    )
+    parser.add_argument(
+        "--no-overwrite",
+        dest="overwrite",
+        action="store_false",
+        help="Do not delete the existing output file; fail if it already exists.",
     )
     parser.add_argument(
         "--dry-run",
@@ -616,8 +624,11 @@ def main():
     output_file = output_dir / f"{args.dataset_name}.hdf5"
     if not args.dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
-        if output_file.exists() and not args.overwrite:
-            raise FileExistsError(f"{output_file} already exists. Use --overwrite to replace it.")
+        if output_file.exists():
+            if args.overwrite:
+                output_file.unlink()
+            else:
+                raise FileExistsError(f"{output_file} already exists. Use --overwrite to replace it.")
 
     channel_template = load_channel_template(args.channel_template)
     dataset = None if args.dry_run else h5Dataset(output_dir, args.dataset_name)
