@@ -4,7 +4,7 @@ This document explains how EEG data moves through the LaBraM codebase and
 describes the responsibility of each major file. Use it as the first stop
 when planning training, fine-tuning, or deployment changes.
 
-## End-to-End Data & Control Flow
+## End-to-End Data, Training, and Inference Flow
 
 ```
 Raw EEG (EDF/BDF/CNT ...)
@@ -26,15 +26,22 @@ Raw EEG (EDF/BDF/CNT ...)
    │           ↳ modeling_pretrain.NeuralTransformerForMEM learns contextual
    │             representations; checkpoints saved to checkpoints/labram-*
    │
-   └─► Fine-tuning / Evaluation
-           run_class_finetuning.py → engine_for_finetuning.train_one_epoch()
+      └─► Fine-tuning
+            run_class_finetuning.py → engine_for_finetuning.train_one_epoch()
                ↳ utils.prepare_TUAB/TUEV → PyTorch datasets + metrics
                ↳ modeling_finetune.NeuralTransformer consumes raw EEG patches
                ↳ Saves downstream heads (classification / regression)
 
-Inference follows the same fine-tuning path but skips gradient steps:
-`run_class_finetuning.py --eval --finetune <checkpoint>` loads weights and
-calls `engine_for_finetuning.evaluate()`.
+   Deployment / inference:
+      • run_class_finetuning.py --eval --finetune <checkpoint>
+         ↳ Loads pretrained weights (teacher/student) via utils.load_state_dict()
+         ↳ Builds DataLoader with same channel map
+         ↳ engine_for_finetuning.evaluate() runs forward-only pass, aggregates metrics
+      • For bespoke apps export modeling_finetune.NeuralTransformer via torch.jit
+         or ONNX: instantiate model, load checkpoint, call model.eval(), then
+         trace with sample tensor shaped [batch, channels, windows, patch]
+      • Optional streaming: feed rolling windows through TemporalConv front-end
+         and reuse cached hidden states if implemented downstream
 ```
 
 ### Control Signals & Decisions
