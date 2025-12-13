@@ -3,7 +3,12 @@
 This script walks one or more BIDS-compliant EEG datasets (default location:
 `D:/neuro_datasets`), applies the same filtering / resampling stack used by the
 shipping LaBraM scripts, and stores the results in the HDF5 layout consumed by
-`data_processor.dataset` and `utils.build_pretraining_dataset`.
+`data_processor.dataset` and `utils.build_pretraining_dataset`. It inspects the
+subject/session `scans.tsv` metadata to automatically resolve the underlying EEG
+file extension, allowing ingestion of binary formats such as EDF/BDF and
+tabular exports (`*.tsv`, `*.csv`, and their `.gz` variants). When the supplied
+`--bids-root` contains multiple datasets (for example, several OpenNeuro downloads
+in sibling folders), the script will traverse each dataset automatically.
 
 Usage example (Windows PowerShell):
 
@@ -13,6 +18,15 @@ python dataset_maker/make_bids_h5dataset.py \
     --output-dir ./checkpoints/bids_h5 \
     --dataset-name bids_labram \
     --channel-template dataset_maker/channel_order_62.json
+
+Dry-run example (no output written):
+
+```
+python dataset_maker/make_bids_h5dataset.py \
+    --bids-root D:/neuro_datasets \
+    --log-level INFO \
+    --dry-run
+```
 ```
 
 The script requires `mne-bids` (already installed per user note) and only adds a
@@ -23,14 +37,17 @@ duplicating preprocessing logic.
 from __future__ import annotations
 
 import argparse
+import csv
+import gzip
 import json
 import logging
 from pathlib import Path
 import sys
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from mne_bids import BIDSPath, get_entity_vals, read_raw_bids
+import mne
+from mne_bids import BIDSPath, read_raw_bids
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -41,6 +58,7 @@ from dataset_maker.shock.utils.h5 import h5Dataset
 from dataset_maker.shock.utils.eegUtils import preprocessing_edf
 
 SUPPORTED_HELPER_EXTS = {".edf", ".bdf"}
+TABULAR_EXTENSIONS = {".tsv": "\t", ".csv": ","}
 LOGGER = logging.getLogger("labram.bids")
 
 
@@ -116,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Walk the datasets, report estimated HDF5 sizes, but do not write output",
+        help="Walk the datasets and report estimated HDF5 sizes, but do not write output",
     )
     parser.add_argument(
         "--log-level",
@@ -144,13 +162,130 @@ def load_channel_template(path: Optional[Path]) -> Optional[List[str]]:
 
 
 def iter_bids_paths(bids_root: Path) -> Iterable[BIDSPath]:
-    template = BIDSPath(root=bids_root, datatype="eeg", suffix="eeg")
+    for dataset_root in discover_bids_roots(bids_root):
+        yield from _iter_dataset_paths(dataset_root)
+
+
+def discover_bids_roots(root: Path) -> List[Path]:
+    root = root.resolve()
+    descriptor = root / "dataset_description.json"
+    if descriptor.exists():
+        return [root]
+
+    children = []
+    try:
+        for child in sorted(root.iterdir()):
+            if not child.is_dir():
+                continue
+            if (child / "dataset_description.json").exists():
+                children.append(child)
+    except FileNotFoundError:
+        LOGGER.error("BIDS root %s cannot be read", root)
+        return []
+
+    if children:
+        LOGGER.info("Discovered %d BIDS dataset(s) under %s", len(children), root)
+        return children
+
+    LOGGER.warning("No dataset_description.json found under %s; treating it as a single BIDS dataset", root)
+    return [root]
+
+
+def _iter_dataset_paths(dataset_root: Path) -> Iterable[BIDSPath]:
+    discovered_any = False
+    for meta_path in _iter_metadata_bids_paths(dataset_root):
+        discovered_any = True
+        yield meta_path
+
+    if discovered_any:
+        return
+
+    template = BIDSPath(root=dataset_root, datatype="eeg", suffix="eeg")
     matches = template.match()
     if not matches:
-        LOGGER.warning("No EEG files found under %s", bids_root)
+        LOGGER.warning("No EEG files found under %s", dataset_root)
         return []
     for match in matches:
         yield match
+
+
+def _iter_metadata_bids_paths(bids_root: Path) -> Iterable[BIDSPath]:
+    seen = set()
+    for scans_file in bids_root.rglob("scans.tsv"):
+        if any(part == "derivatives" for part in scans_file.parts):
+            continue
+        for bids_path in _paths_from_scans_file(scans_file, bids_root):
+            if bids_path.fpath in seen:
+                continue
+            seen.add(bids_path.fpath)
+            yield bids_path
+
+
+def _paths_from_scans_file(scans_path: Path, bids_root: Path) -> Iterable[BIDSPath]:
+    if not scans_path.exists():
+        return []
+
+    base_dir = scans_path.parent
+    try:
+        with scans_path.open("r", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            if not reader.fieldnames:
+                return []
+            filename_key = next((name for name in reader.fieldnames if name and name.lower() == "filename"), None)
+            if filename_key is None:
+                return []
+            for row in reader:
+                rel_path = (row.get(filename_key) or "").strip()
+                if not rel_path or "_eeg" not in rel_path:
+                    continue
+                data_path = (base_dir / rel_path).resolve()
+                try:
+                    data_path.relative_to(bids_root.resolve())
+                except ValueError:
+                    LOGGER.debug("Skipping %s because it is outside the BIDS root", data_path)
+                    continue
+                try:
+                    yield BIDSPath(fpath=data_path)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.debug("Could not build BIDSPath from %s: %s", data_path, exc)
+    except FileNotFoundError:
+        return []
+
+
+def _canonical_extension(path: Path) -> str:
+    suffixes = [s.lower() for s in path.suffixes]
+    if not suffixes:
+        return ""
+    if suffixes[-1] == ".gz" and len(suffixes) >= 2:
+        return suffixes[-2]
+    return suffixes[-1]
+
+
+def _open_text_file(path: Path):
+    if path.suffix.lower() == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open("r", encoding="utf-8")
+
+
+def _load_tabular_matrix(path: Path, delimiter: str) -> Tuple[np.ndarray, List[str]]:
+    with _open_text_file(path) as handle:
+        header_line = handle.readline().strip()
+        if not header_line:
+            raise ValueError(f"Missing header row in {path}")
+        headers = [col.strip() or f"CH{idx+1}" for idx, col in enumerate(header_line.split(delimiter))]
+        data = np.loadtxt(handle, delimiter=delimiter, dtype=np.float64, ndmin=2)
+    data = data.T  # channels × samples
+    return data, [name.upper() for name in headers]
+
+
+def _load_sampling_frequency(bids_path: BIDSPath) -> float:
+    sidecar = bids_path.copy().update(suffix="eeg", extension=".json", check=False)
+    if not sidecar.fpath.exists():
+        raise FileNotFoundError(f"Sidecar JSON not found for {bids_path.basename}")
+    metadata = json.loads(sidecar.fpath.read_text(encoding="utf-8"))
+    if "SamplingFrequency" not in metadata:
+        raise KeyError(f"SamplingFrequency missing in {sidecar.fpath}")
+    return float(metadata["SamplingFrequency"])
 
 
 def apply_standard_preprocessing(raw, l_freq: float, h_freq: float, notch_freq: float, resample: int):
@@ -170,8 +305,8 @@ def preprocess_recording(
     drop_channels: Optional[Sequence[str]],
     standard_channels: Optional[Sequence[str]],
 ):
-    ext = bids_path.extension or ""
-    if ext in SUPPORTED_HELPER_EXTS:
+    ext = _canonical_extension(bids_path.fpath)
+    if ext == ".edf":
         return preprocessing_edf(
             bids_path.fpath,
             l_freq=l_freq,
@@ -181,10 +316,85 @@ def preprocess_recording(
             standard_channels=list(standard_channels) if standard_channels else None,
         )
 
+    if ext == ".bdf":
+        return preprocess_bdf_recording(
+            bids_path,
+            l_freq=l_freq,
+            h_freq=h_freq,
+            notch_freq=notch_freq,
+            resample=resample,
+            drop_channels=drop_channels,
+            standard_channels=standard_channels,
+        )
+
+    if ext in TABULAR_EXTENSIONS:
+        return preprocess_tabular_recording(
+            bids_path,
+            delimiter=TABULAR_EXTENSIONS[ext],
+            l_freq=l_freq,
+            h_freq=h_freq,
+            notch_freq=notch_freq,
+            resample=resample,
+            drop_channels=drop_channels,
+            standard_channels=standard_channels,
+        )
+
     raw = read_raw_bids(bids_path, verbose="ERROR")
     if drop_channels:
         usable = [ch for ch in raw.ch_names if ch not in drop_channels]
         raw.pick_channels(usable, ordered=True)
+    if standard_channels and len(standard_channels) == len(raw.ch_names):
+        try:
+            raw.reorder_channels(list(standard_channels))
+        except ValueError:
+            LOGGER.warning("Channel reorder failed for %s; keeping native order", bids_path.basename)
+    data, ch_names = apply_standard_preprocessing(raw, l_freq, h_freq, notch_freq, resample)
+    return data, ch_names
+
+
+def preprocess_tabular_recording(
+    bids_path: BIDSPath,
+    delimiter: str,
+    l_freq: float,
+    h_freq: float,
+    notch_freq: float,
+    resample: int,
+    drop_channels: Optional[Sequence[str]],
+    standard_channels: Optional[Sequence[str]],
+):
+    data_matrix, ch_names = _load_tabular_matrix(bids_path.fpath, delimiter)
+    sfreq = _load_sampling_frequency(bids_path)
+    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="eeg")
+    raw = mne.io.RawArray(data_matrix, info, verbose="ERROR")
+
+    if drop_channels:
+        drop = [ch for ch in drop_channels if ch in raw.ch_names]
+        if drop:
+            raw.drop_channels(drop)
+    if standard_channels and len(standard_channels) == len(raw.ch_names):
+        try:
+            raw.reorder_channels(list(standard_channels))
+        except ValueError:
+            LOGGER.warning("Channel reorder failed for %s; keeping native order", bids_path.basename)
+
+    data, ch_names = apply_standard_preprocessing(raw, l_freq, h_freq, notch_freq, resample)
+    return data, ch_names
+
+
+def preprocess_bdf_recording(
+    bids_path: BIDSPath,
+    l_freq: float,
+    h_freq: float,
+    notch_freq: float,
+    resample: int,
+    drop_channels: Optional[Sequence[str]],
+    standard_channels: Optional[Sequence[str]],
+):
+    raw = mne.io.read_raw_bdf(bids_path.fpath, preload=True, verbose="ERROR")
+    if drop_channels:
+        drop = [ch for ch in drop_channels if ch in raw.ch_names]
+        if drop:
+            raw.drop_channels(drop)
     if standard_channels and len(standard_channels) == len(raw.ch_names):
         try:
             raw.reorder_channels(list(standard_channels))
