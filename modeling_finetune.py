@@ -10,11 +10,14 @@
 
 import math
 from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.models.layers import drop_path, to_2tuple, trunc_normal_
+from timm.layers.drop import drop_path
+from timm.layers.helpers import to_2tuple
+from timm.layers.weight_init import trunc_normal_
 from timm.models.registry import register_model
 from einops import rearrange
 
@@ -28,12 +31,13 @@ def _cfg(url='', **kwargs):
         **kwargs
     }
 
+NormLayer = Callable[[int], nn.Module]
+
 
 class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
-    """
-    def __init__(self, drop_prob=None):
-        super(DropPath, self).__init__()
+    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
         self.drop_prob = drop_prob
 
     def forward(self, x):
@@ -90,6 +94,10 @@ class Attention(nn.Module):
             self.q_norm = None
             self.k_norm = None
 
+        self.window_size: Optional[Tuple[int, int]] = None
+        self.relative_position_bias_table: Optional[nn.Parameter] = None
+        self.relative_position_index: Optional[torch.Tensor] = None
+
         if window_size:
             self.window_size = window_size
             self.num_relative_distance = (2 * window_size[0] - 1) * (2 * window_size[1] - 1) + 3
@@ -127,8 +135,15 @@ class Attention(nn.Module):
     def forward(self, x, rel_pos_bias=None, return_attention=False, return_qkv=False):
         B, N, C = x.shape
         qkv_bias = None
-        if self.q_bias is not None:
-            qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias))
+        if self.q_bias is not None and self.v_bias is not None:
+            zeros = torch.zeros_like(self.v_bias, requires_grad=False)
+            qkv_bias = torch.cat(
+                (
+                    cast(torch.Tensor, self.q_bias),
+                    zeros,
+                    cast(torch.Tensor, self.v_bias),
+                )
+            )
         # qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
         qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
@@ -141,11 +156,18 @@ class Attention(nn.Module):
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
-        if self.relative_position_bias_table is not None:
-            relative_position_bias = \
+        if (
+            self.relative_position_bias_table is not None
+            and self.relative_position_index is not None
+            and self.window_size is not None
+        ):
+            relative_position_bias = (
                 self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
                     self.window_size[0] * self.window_size[1] + 1,
-                    self.window_size[0] * self.window_size[1] + 1, -1)  # Wh*Ww,Wh*Ww,nH
+                    self.window_size[0] * self.window_size[1] + 1,
+                    -1,
+                )
+            )  # Wh*Ww,Wh*Ww,nH
             relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
             attn = attn + relative_position_bias.unsqueeze(0)
 
@@ -171,9 +193,23 @@ class Attention(nn.Module):
 
 class Block(nn.Module):
 
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_norm=None, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., init_values=None, act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 window_size=None, attn_head_dim=None):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        qk_norm=None,
+        qk_scale=None,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        init_values=None,
+        act_layer=nn.GELU,
+        norm_layer: Callable[[int], nn.Module] = nn.LayerNorm,
+        window_size=None,
+        attn_head_dim=None,
+    ):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(
@@ -186,8 +222,8 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
         if init_values is not None and init_values > 0:
-            self.gamma_1 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
-            self.gamma_2 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
+            self.gamma_1 = nn.Parameter(init_values * torch.ones((dim)), requires_grad=True)
+            self.gamma_2 = nn.Parameter(init_values * torch.ones((dim)), requires_grad=True)
         else:
             self.gamma_1, self.gamma_2 = None, None
 
@@ -261,44 +297,81 @@ class TemporalConv(nn.Module):
 
 
 class NeuralTransformer(nn.Module):
-    def __init__(self, EEG_size=1600, patch_size=200, in_chans=1, out_chans=8, num_classes=1000, embed_dim=200, depth=12,
-                 num_heads=10, mlp_ratio=4., qkv_bias=False, qk_norm=None, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
-                 drop_path_rate=0., norm_layer=nn.LayerNorm, init_values=None,
-                 use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False,
-                 use_mean_pooling=True, init_scale=0.001, **kwargs):
+    def __init__(
+        self,
+        EEG_size: int = 1600,
+        patch_size: int = 200,
+        in_chans: int = 1,
+        out_chans: int = 8,
+        num_classes: int = 1000,
+        embed_dim: int = 200,
+        depth: int = 12,
+        num_heads: int = 10,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = False,
+        qk_norm: Optional[NormLayer] = None,
+        qk_scale: Optional[float] = None,
+        drop_rate: float = 0.0,
+        attn_drop_rate: float = 0.0,
+        drop_path_rate: float = 0.0,
+        norm_layer: NormLayer = nn.LayerNorm,
+        init_values: Optional[float] = None,
+        use_abs_pos_emb: bool = True,
+        use_rel_pos_bias: bool = False,
+        use_shared_rel_pos_bias: bool = False,
+        use_mean_pooling: bool = True,
+        init_scale: float = 0.001,
+        **kwargs,
+    ):
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+        self.default_cfg: Dict[str, Any] = {}
 
         # To identify whether it is neural tokenizer or neural decoder. 
         # For the neural decoder, use linear projection (PatchEmbed) to project codebook dimension to hidden dimension.
         # Otherwise, use TemporalConv to extract temporal features from EEG signals.
-        self.patch_embed = TemporalConv(out_chans=out_chans) if in_chans == 1 else PatchEmbed(EEG_size=EEG_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        self.patch_embed = (
+            TemporalConv(out_chans=out_chans)
+            if in_chans == 1
+            else PatchEmbed(EEG_size=EEG_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        )
         self.time_window = EEG_size // patch_size
         self.patch_size = patch_size
 
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        # self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        if use_abs_pos_emb:
-            self.pos_embed = nn.Parameter(torch.zeros(1, 128 + 1, embed_dim), requires_grad=True)
-        else:
-            self.pos_embed = None
-        self.time_embed = nn.Parameter(torch.zeros(1, 16, embed_dim), requires_grad=True)
+        self.pos_embed: Optional[nn.Parameter] = (
+            nn.Parameter(torch.zeros(1, 128 + 1, embed_dim), requires_grad=True) if use_abs_pos_emb else None
+        )
+        self.time_embed: Optional[nn.Parameter] = nn.Parameter(torch.zeros(1, 16, embed_dim), requires_grad=True)
         self.pos_drop = nn.Dropout(p=drop_rate)
-
-        self.rel_pos_bias = None
+        self.rel_pos_bias: Optional[Callable[[], torch.Tensor]] = None
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.use_rel_pos_bias = use_rel_pos_bias
-        self.blocks = nn.ModuleList([
-            Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_norm=qk_norm, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
-                init_values=init_values, window_size=None)
-            for i in range(depth)])
-        self.norm = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
-        self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
-        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        self.use_shared_rel_pos_bias = use_shared_rel_pos_bias
+        self.blocks: nn.ModuleList = nn.ModuleList(
+            [
+                Block(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    qk_norm=qk_norm,
+                    qk_scale=qk_scale,
+                    drop=drop_rate,
+                    attn_drop=attn_drop_rate,
+                    drop_path=dpr[i],
+                    norm_layer=norm_layer,
+                    init_values=init_values,
+                    window_size=None,
+                )
+                for i in range(depth)
+            ]
+        )
+        self.norm: nn.Module = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
+        self.fc_norm: Optional[nn.Module] = norm_layer(embed_dim) if use_mean_pooling else None
+        self.head: nn.Module = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
         if self.pos_embed is not None:
             trunc_normal_(self.pos_embed, std=.02)
@@ -320,8 +393,9 @@ class NeuralTransformer(nn.Module):
             param.div_(math.sqrt(2.0 * layer_id))
 
         for layer_id, layer in enumerate(self.blocks):
-            rescale(layer.attn.proj.weight.data, layer_id + 1)
-            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
+            block = cast(Block, layer)
+            rescale(block.attn.proj.weight.data, layer_id + 1)
+            rescale(block.mlp.fc2.weight.data, layer_id + 1)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -335,7 +409,6 @@ class NeuralTransformer(nn.Module):
     def get_num_layers(self):
         return len(self.blocks)
 
-    @torch.jit.ignore
     def no_weight_decay(self):
         return {'pos_embed', 'cls_token', 'time_embed'}
 
@@ -351,14 +424,28 @@ class NeuralTransformer(nn.Module):
         input_time_window = a if t == self.patch_size else t
         x = self.patch_embed(x)
 
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+        cls_tokens: torch.Tensor = cast(torch.Tensor, self.cls_token.expand(batch_size, -1, -1))
 
         x = torch.cat((cls_tokens, x), dim=1)
 
-        pos_embed_used = self.pos_embed[:, input_chans] if input_chans is not None else self.pos_embed
         if self.pos_embed is not None:
-            pos_embed = pos_embed_used[:, 1:, :].unsqueeze(2).expand(batch_size, -1, input_time_window, -1).flatten(1, 2)
-            pos_embed = torch.cat((pos_embed_used[:,0:1,:].expand(batch_size, -1, -1), pos_embed), dim=1)
+            pos_embed_tensor: torch.Tensor = cast(torch.Tensor, self.pos_embed)
+            pos_embed_used: torch.Tensor = (
+                pos_embed_tensor[:, input_chans] if input_chans is not None else pos_embed_tensor
+            )
+            pos_embed = (
+                pos_embed_used[:, 1:, :]
+                .unsqueeze(2)
+                .expand(batch_size, -1, input_time_window, -1)
+                .flatten(1, 2)
+            )
+            pos_embed = torch.cat(
+                (
+                    pos_embed_used[:, 0:1, :].expand(batch_size, -1, -1),
+                    pos_embed,
+                ),
+                dim=1,
+            )
             x = x + pos_embed
         if self.time_embed is not None:
             nc = n if t == self.patch_size else a
@@ -400,11 +487,23 @@ class NeuralTransformer(nn.Module):
         x = self.patch_embed(x)
         batch_size, seq_len, _ = x.size()
 
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+        cls_tokens: torch.Tensor = cast(torch.Tensor, self.cls_token.expand(batch_size, -1, -1))
         x = torch.cat((cls_tokens, x), dim=1)
         if self.pos_embed is not None:
-            pos_embed = self.pos_embed[:, 1:, :].unsqueeze(2).expand(batch_size, -1, self.time_window, -1).flatten(1, 2)
-            pos_embed = torch.cat((self.pos_embed[:,0:1,:].expand(batch_size, -1, -1), pos_embed), dim=1)
+            pos_embed_tensor: torch.Tensor = cast(torch.Tensor, self.pos_embed)
+            pos_embed = (
+                pos_embed_tensor[:, 1:, :]
+                .unsqueeze(2)
+                .expand(batch_size, -1, self.time_window, -1)
+                .flatten(1, 2)
+            )
+            pos_embed = torch.cat(
+                (
+                    pos_embed_tensor[:, 0:1, :].expand(batch_size, -1, -1),
+                    pos_embed,
+                ),
+                dim=1,
+            )
             x = x + pos_embed
         if self.time_embed is not None:
             time_embed = self.time_embed.unsqueeze(1).expand(batch_size, 62, -1, -1).flatten(1, 2)
@@ -415,10 +514,13 @@ class NeuralTransformer(nn.Module):
         if isinstance(layer_id, list):
             output_list = []
             for l, blk in enumerate(self.blocks):
-                x = blk(x, rel_pos_bias=rel_pos_bias)
+                block = cast(Block, blk)
+                x = block(x, rel_pos_bias=rel_pos_bias)
                 # use last norm for all intermediate layers
                 if l in layer_id:
                     if norm_output:
+                        if self.fc_norm is None:
+                            raise RuntimeError("fc_norm must be configured when norm_output=True")
                         x_norm = self.fc_norm(self.norm(x[:, 1:]))
                         output_list.append(x_norm)
                     else:
@@ -426,10 +528,11 @@ class NeuralTransformer(nn.Module):
             return output_list
         elif isinstance(layer_id, int):
             for l, blk in enumerate(self.blocks):
+                block = cast(Block, blk)
                 if l < layer_id:
-                    x = blk(x, rel_pos_bias=rel_pos_bias)
+                    x = block(x, rel_pos_bias=rel_pos_bias)
                 elif l == layer_id:
-                    x = blk.norm1(x)
+                    x = block.norm1(x)
                 else:
                     break
             return x[:, 1:]
@@ -440,11 +543,23 @@ class NeuralTransformer(nn.Module):
         x = self.patch_embed(x)
         batch_size, seq_len, _ = x.size()
 
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+        cls_tokens: torch.Tensor = cast(torch.Tensor, self.cls_token.expand(batch_size, -1, -1))
         x = torch.cat((cls_tokens, x), dim=1)
         if self.pos_embed is not None:
-            pos_embed = self.pos_embed[:, 1:, :].unsqueeze(2).expand(batch_size, -1, self.time_window, -1).flatten(1, 2)
-            pos_embed = torch.cat((self.pos_embed[:,0:1,:].expand(batch_size, -1, -1), pos_embed), dim=1)
+            pos_embed_tensor: torch.Tensor = cast(torch.Tensor, self.pos_embed)
+            pos_embed = (
+                pos_embed_tensor[:, 1:, :]
+                .unsqueeze(2)
+                .expand(batch_size, -1, self.time_window, -1)
+                .flatten(1, 2)
+            )
+            pos_embed = torch.cat(
+                (
+                    pos_embed_tensor[:, 0:1, :].expand(batch_size, -1, -1),
+                    pos_embed,
+                ),
+                dim=1,
+            )
             x = x + pos_embed
         if self.time_embed is not None:
             time_embed = self.time_embed.unsqueeze(1).expand(batch_size, 62, -1, -1).flatten(1, 2)
