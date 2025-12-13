@@ -8,12 +8,15 @@
 # https://github.com/facebookresearch/dino
 # ---------------------------------------------------------
 
+import math
+from functools import partial
+from typing import Any, Dict, Optional, Sequence
+
 import torch
 from torch import nn
 import torch.nn.functional as F
-from functools import partial
 from einops import rearrange
-from timm.models.layers import trunc_normal_
+from timm.layers.weight_init import trunc_normal_
 from timm.models.registry import register_model
 
 from modeling_finetune import NeuralTransformer
@@ -87,10 +90,16 @@ class VQNSP(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
             
-    @torch.jit.ignore
     def no_weight_decay(self):
-        return {'quantize.embedding.weight', 'decoder.cls_token', 'decoder.pos_embed', 'decoder.time_embed', 
-                'encoder.cls_token', 'encoder.pos_embed', 'encoder.time_embed'}
+        return {
+            'quantize.embedding.weight',
+            'decoder.cls_token',
+            'decoder.pos_embed',
+            'decoder.time_embed',
+            'encoder.cls_token',
+            'encoder.pos_embed',
+            'encoder.time_embed',
+        }
 
     @property
     def device(self):
@@ -189,7 +198,10 @@ def vqnsp_encoder_base_decoder_3x200x12(pretrained=False, pretrained_weight=None
     encoder_config['EEG_size'] = EEG_size
     encoder_config['num_classes'] = 0
     # decoder settings
-    decoder_config['EEG_size'] = EEG_size // decoder_config['patch_size']
+    decoder_patch_size = decoder_config['patch_size']
+    if not isinstance(decoder_patch_size, int):
+        raise TypeError(f"decoder patch_size must be int, not {type(decoder_patch_size)}")
+    decoder_config['EEG_size'] = EEG_size // decoder_patch_size
     decoder_config['patch_size'] = 1
     decoder_config['in_chans'] = code_dim
     decoder_config['num_classes'] = 0
@@ -230,7 +242,10 @@ def vqnsp_encoder_large_decoder_3x200x24(pretrained=False, pretrained_weight=Non
     encoder_config['num_classes'] = 0
     encoder_config['depth'] = 24
     # decoder settings
-    decoder_config['EEG_size'] = EEG_size // decoder_config['patch_size']
+    decoder_patch_size = decoder_config['patch_size']
+    if not isinstance(decoder_patch_size, int):
+        raise TypeError(f"decoder patch_size must be int, not {type(decoder_patch_size)}")
+    decoder_config['EEG_size'] = EEG_size // decoder_patch_size
     decoder_config['patch_size'] = 1
     decoder_config['in_chans'] = code_dim
     decoder_config['num_classes'] = 0
@@ -264,9 +279,5 @@ def vqnsp_encoder_large_decoder_3x200x24(pretrained=False, pretrained_weight=Non
 
 if __name__ == '__main__':
     pass
-
-
-
-
 
 

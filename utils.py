@@ -19,6 +19,7 @@ from collections import defaultdict, deque
 import datetime
 import numpy as np
 from timm.utils.model import get_state_dict
+from typing import Any, Iterable, Optional, Sequence
 
 from pathlib import Path
 import argparse
@@ -502,7 +503,17 @@ class NativeScalerWithGradNormCount:
     def __init__(self):
         self._scaler = torch.cuda.amp.GradScaler()
 
-    def __call__(self, loss, optimizer, clip_grad=None, parameters=None, create_graph=False, update_grad=True, layer_names=None):
+    def __call__(
+        self,
+        loss: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+        clip_grad: Optional[float] = None,
+        parameters: Optional[Iterable[torch.nn.Parameter]] = None,
+        create_graph: bool = False,
+        update_grad: bool = True,
+        layer_names: Optional[Sequence[str]] = None,
+        **kwargs: Any,
+    ) -> Optional[torch.Tensor]:
         self._scaler.scale(loss).backward(create_graph=create_graph)
         if update_grad:
             if clip_grad is not None:

@@ -197,7 +197,7 @@ def main(args):
                 dataset, num_replicas=num_tasks, rank=sampler_rank, shuffle=True
             )
             sampler_train_list.append(sampler_train)
-        print("Sampler_train = %s" % str(sampler_train))
+        print("Sampler_train_list = %s" % str(sampler_train_list))
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
@@ -245,10 +245,12 @@ def main(args):
         args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
         warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
     )
+    lr_schedule_values = [float(value) for value in lr_schedule_values]
     if args.weight_decay_end is None:
         args.weight_decay_end = args.weight_decay
     wd_schedule_values = utils.cosine_scheduler(
         args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
+    wd_schedule_values = [float(value) for value in wd_schedule_values]
     print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
     utils.auto_load_model(

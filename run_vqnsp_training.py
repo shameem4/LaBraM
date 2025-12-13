@@ -10,14 +10,15 @@
 
 import argparse
 import datetime
-import numpy as np
-import time
-import torch
-import torch.backends.cudnn as cudnn
 import json
 import os
+import time
 
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
 from pathlib import Path
+from typing import Optional, Sequence
 
 from timm.models import create_model
 from optim_factory import create_optimizer
@@ -161,9 +162,9 @@ def main(args):
     datasets_val = [
         ["path/to/datasets_val"]
     ]
-    if args.disable_eval:
-        dataset_val_list = None
-    else:
+    dataset_val_list: Optional[list] = None
+    val_ch_names_list: Optional[Sequence] = None
+    if not args.disable_eval:
         dataset_val_list, val_ch_names_list = utils.build_pretraining_dataset(datasets_val, [4])
 
     if True:  # args.distributed:
@@ -179,21 +180,22 @@ def main(args):
             )
             sampler_train_list.append(sampler_train)
 
-        print("Sampler_train = %s" % str(sampler_train))
+        print("Sampler_train_list = %s" % str(sampler_train_list))
         sampler_eval_list = []
-        if args.dist_eval:
-            # if len(dataset_val) % num_tasks != 0:
-            #     print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-            #           'This will slightly alter validation results as extra duplicate entries are added to achieve '
-            #           'equal num of samples per-process.')
-            for dataset in dataset_val_list:
-                sampler_val = torch.utils.data.DistributedSampler(
-                    dataset, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-                sampler_eval_list.append(sampler_val)
-        else:
-            for dataset in dataset_val_list:
-                sampler_val = torch.utils.data.SequentialSampler(dataset)
-                sampler_eval_list.append(sampler_val)
+        if dataset_val_list is not None:
+            if args.dist_eval:
+                # if len(dataset_val) % num_tasks != 0:
+                #     print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
+                #           'This will slightly alter validation results as extra duplicate entries are added to achieve '
+                #           'equal num of samples per-process.')
+                for dataset in dataset_val_list:
+                    sampler_val = torch.utils.data.DistributedSampler(
+                        dataset, num_replicas=num_tasks, rank=global_rank, shuffle=False)
+                    sampler_eval_list.append(sampler_val)
+            else:
+                for dataset in dataset_val_list:
+                    sampler_val = torch.utils.data.SequentialSampler(dataset)
+                    sampler_eval_list.append(sampler_val)
     else:
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
@@ -215,6 +217,7 @@ def main(args):
         )
         data_loader_train_list.append(data_loader_train)
 
+    data_loader_val_list: Optional[list] = None
     if dataset_val_list is not None:
         data_loader_val_list = []
         for dataset, sampler in zip(dataset_val_list, sampler_eval_list):
@@ -228,6 +231,8 @@ def main(args):
             data_loader_val_list.append(data_loader_val)
     else:
         data_loader_val_list = None
+
+    data_loader_val = data_loader_val_list[0] if data_loader_val_list else None
 
     model.to(device)
     model_without_ddp = model
@@ -266,16 +271,36 @@ def main(args):
         args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
         warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
     )
+    lr_schedule_values = [float(value) for value in lr_schedule_values]
 
     utils.auto_load_model(
         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
             
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device, log_writer, 0, args=args)
+        if data_loader_val_list is None:
+            raise ValueError("Evaluation requested but no validation datasets were provided.")
+        test_stats = evaluate(
+            data_loader_val_list,
+            model,
+            device,
+            log_writer,
+            0,
+            ch_names_list=val_ch_names_list,
+            args=args,
+        )
         exit(0)
         
     if args.calculate_codebook_usage:
-        test_stats = calculate_codebook_usage(data_loader_val, model, device, log_writer, 0, args=args)
+        if data_loader_val is None:
+            raise ValueError("Codebook usage requested but no validation dataloader was created.")
+        test_stats = calculate_codebook_usage(
+            data_loader_val,
+            model,
+            device,
+            log_writer,
+            0,
+            args=args,
+        )
         exit(0)
         
     print(f"Start training for {args.epochs} epochs")
@@ -308,6 +333,8 @@ def main(args):
                 loss_scaler=loss_scaler, epoch=epoch, save_ckpt_freq=args.save_ckpt_freq)
         
         if data_loader_val_list is not None:
+            assert dataset_val_list is not None
+            assert val_ch_names_list is not None
             test_stats = evaluate(data_loader_val_list, model, device, log_writer, epoch, ch_names_list=val_ch_names_list, args=args)
             print(f"Validation loss of the network on the {sum([len(dataset) for dataset in dataset_val_list])} test EEG: {test_stats['loss']:.4f}")
 

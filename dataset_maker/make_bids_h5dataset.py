@@ -41,9 +41,10 @@ import csv
 import gzip
 import json
 import logging
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 import sys
-from typing import Iterable, List, Optional, Sequence, Tuple, cast
+from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple, TypedDict, Union, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -63,6 +64,33 @@ TABULAR_EXTENSIONS = {".tsv": "\t", ".csv": ","}
 LOGGER = logging.getLogger("labram.bids")
 
 EEGArray = NDArray[np.floating]
+
+
+class PreprocessConfig(TypedDict):
+    l_freq: float
+    h_freq: float
+    notch_freq: float
+    resample: int
+    resample_n_jobs: Union[int, str]
+    mne_verbose: str
+    drop_channels: Sequence[str]
+    standard_channels: Optional[Sequence[str]]
+
+
+class PreprocessResultOk(TypedDict):
+    status: Literal["ok"]
+    bids_path: BIDSPath
+    data: Optional[EEGArray]
+    ch_names: List[str]
+
+
+class PreprocessResultError(TypedDict):
+    status: Literal["error"]
+    bids_path: BIDSPath
+    exception: Exception
+
+
+PreprocessResult = Union[PreprocessResultOk, PreprocessResultError]
 
 
 def parse_args() -> argparse.Namespace:
@@ -367,9 +395,36 @@ def apply_standard_preprocessing(
     raw.load_data(verbose=mne_verbose)
     raw.filter(l_freq=l_freq, h_freq=h_freq, verbose=mne_verbose)
     raw.notch_filter(notch_freq, verbose=mne_verbose)
-    raw.resample(resample, n_jobs=resample_n_jobs, verbose=mne_verbose)
+    events = _extract_event_matrix(raw)
+    raw.resample(resample, n_jobs=resample_n_jobs, events=events, verbose=mne_verbose)
     data = cast(EEGArray, raw.get_data(units="uV"))
     return data, list(raw.ch_names)
+
+
+def _extract_event_matrix(raw) -> Optional[NDArray[np.int64]]:
+    """Capture stim-based events before resampling so resolution stays accurate."""
+    stim_picks = mne.pick_types(raw.info, stim=True)
+    if not stim_picks:
+        return None
+    stim_channel = raw.ch_names[stim_picks[0]]
+    try:
+        events = mne.find_events(raw, stim_channel=stim_channel, verbose="ERROR")
+    except (ValueError, RuntimeError) as exc:  # pragma: no cover - best effort
+        LOGGER.debug("Could not extract events from %s: %s", stim_channel, exc)
+        return None
+    if events.size == 0:
+        return None
+    return events
+
+
+def _preprocess_task(payload: Tuple[BIDSPath, PreprocessConfig]) -> PreprocessResult:
+    """Worker wrapper so multiprocessing can call preprocess_recording safely."""
+    bids_path, config = payload
+    try:
+        data, ch_names = preprocess_recording(bids_path, **config)
+    except Exception as exc:  # pragma: no cover - best effort
+        return {"status": "error", "bids_path": bids_path, "exception": exc}
+    return {"status": "ok", "bids_path": bids_path, "data": data, "ch_names": ch_names}
 
 
 def preprocess_recording(
@@ -554,68 +609,89 @@ def main():
     processed = 0
     chunks = None
     total_bytes = 0
+
+    preprocess_config: PreprocessConfig = {
+        "l_freq": args.l_freq,
+        "h_freq": args.h_freq,
+        "notch_freq": args.notch,
+        "resample": args.resample,
+        "resample_n_jobs": resample_n_jobs,
+        "mne_verbose": args.mne_log_level,
+        "drop_channels": args.drop_channels,
+        "standard_channels": channel_template,
+    }
+
+    tasks: List[BIDSPath] = []
+    limit_reached = False
     for bids_path in iter_bids_paths_selected(
         args.bids_root, dataset_index=args.dataset_index, max_datasets=args.max_datasets
     ):
-        if args.max_recordings is not None and processed >= args.max_recordings:
-            LOGGER.info("Reached --max-recordings=%d, stopping early", args.max_recordings)
+        if args.max_recordings is not None and len(tasks) >= args.max_recordings:
+            limit_reached = True
             break
         LOGGER.info("Processing %s", bids_path.basename)
         if not bids_path.fpath.exists():
             LOGGER.warning("Skipping %s because file is missing (%s)", bids_path.basename, bids_path.fpath)
             continue
+        tasks.append(bids_path)
+    if limit_reached:
+        LOGGER.info("Reached --max-recordings=%d, stopping early", args.max_recordings)
+
+    if tasks:
         try:
-            eeg_data, ch_names = preprocess_recording(
-                bids_path,
-                l_freq=args.l_freq,
-                h_freq=args.h_freq,
-                notch_freq=args.notch,
-                resample=args.resample,
-                resample_n_jobs=resample_n_jobs,
-                mne_verbose=args.mne_log_level,
-                drop_channels=args.drop_channels,
-                standard_channels=channel_template,
-            )
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Failed to process %s: %s", bids_path.basename, exc)
-            continue
-
-        if eeg_data is None or len(ch_names) == 0:
-            LOGGER.warning("Skipping %s due to empty data", bids_path.basename)
-            continue
-
-        if args.trim_seconds > 0:
-            trim = args.trim_seconds * args.resample
-            if eeg_data.shape[1] > trim:
-                eeg_data = eeg_data[:, :-trim]
-
-        ch_order = [name.upper() for name in ch_names]
-        chunks = chunks or (len(ch_order), args.resample)
-
-        group_name = bids_path.basename.replace(".eeg", "")
-        bytes_estimate = eeg_data.size * 4  # float32 storage
-        total_bytes += bytes_estimate
-        LOGGER.info(
-            "Estimated size for %s: %.2f MB (%d channels × %d samples)",
-            group_name,
-            bytes_estimate / 1e6,
-            eeg_data.shape[0],
-            eeg_data.shape[1],
+            available_cpus = cpu_count() or 1
+        except NotImplementedError:
+            available_cpus = 1
+        worker_count = min(8, available_cpus)
+        task_iterable: Iterable[Tuple[BIDSPath, PreprocessConfig]] = (
+            (path, preprocess_config) for path in tasks
         )
+        with Pool(processes=worker_count) as pool:
+            for raw_result in pool.imap_unordered(_preprocess_task, task_iterable):
+                result = cast(PreprocessResult, raw_result)
+                bids_path = result["bids_path"]
+                if result["status"] != "ok":
+                    exc = result["exception"]
+                    LOGGER.exception("Failed to process %s: %s", bids_path.basename, exc)
+                    continue
+                eeg_data = result["data"]
+                ch_names = result["ch_names"]
+                if eeg_data is None or len(ch_names) == 0:
+                    LOGGER.warning("Skipping %s due to empty data", bids_path.basename)
+                    continue
 
-        if dataset is None:
-            processed += 1
-            continue
+                if args.trim_seconds > 0:
+                    trim = args.trim_seconds * args.resample
+                    if eeg_data.shape[1] > trim:
+                        eeg_data = eeg_data[:, :-trim]
 
-        grp = dataset.addGroup(group_name)
-        dset = dataset.addDataset(grp, "eeg", eeg_data.astype(np.float32), chunks)
-        dataset.addAttributes(dset, "lFreq", args.l_freq)
-        dataset.addAttributes(dset, "hFreq", args.h_freq)
-        dataset.addAttributes(dset, "rsFreq", args.resample)
-        dataset.addAttributes(dset, "chOrder", ch_order)
-        dataset.addAttributes(dset, "source_bids_path", str(bids_path.fpath))
+                ch_order = [name.upper() for name in ch_names]
+                chunks = chunks or (len(ch_order), args.resample)
 
-        processed += 1
+                group_name = bids_path.basename.replace(".eeg", "")
+                bytes_estimate = eeg_data.size * 4  # float32 storage
+                total_bytes += bytes_estimate
+                LOGGER.info(
+                    "Estimated size for %s: %.2f MB (%d channels × %d samples)",
+                    group_name,
+                    bytes_estimate / 1e6,
+                    eeg_data.shape[0],
+                    eeg_data.shape[1],
+                )
+
+                if dataset is None:
+                    processed += 1
+                    continue
+
+                grp = dataset.addGroup(group_name)
+                dset = dataset.addDataset(grp, "eeg", eeg_data.astype(np.float32), chunks)
+                dataset.addAttributes(dset, "lFreq", args.l_freq)
+                dataset.addAttributes(dset, "hFreq", args.h_freq)
+                dataset.addAttributes(dset, "rsFreq", args.resample)
+                dataset.addAttributes(dset, "chOrder", ch_order)
+                dataset.addAttributes(dset, "source_bids_path", str(bids_path.fpath))
+
+                processed += 1
 
     if dataset is not None:
         dataset.save()

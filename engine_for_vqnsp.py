@@ -10,27 +10,28 @@
 
 import math
 import sys
-from typing import Iterable
+from typing import Any, Iterable, List, Optional, Sequence, cast
 
 import torch
 import torch.nn as nn
 
 import utils
 
-def train_one_epoch(model: torch.nn.Module, 
-                            data_loader_list: Iterable, 
-                            optimizer: torch.optim.Optimizer,
-                            device: torch.device, 
-                            epoch: int, 
-                            loss_scaler, 
-                            clip_grad: float = 0,
-                            log_writer=None, 
-                            lr_scheduler=None, 
-                            start_steps=None,
-                            lr_schedule_values=None,
-                            ch_names_list=None,
-                            args=None,
-                            ):
+def train_one_epoch(
+    model: torch.nn.Module,
+    data_loader_list: Iterable,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    loss_scaler: Any,
+    clip_grad: float = 0,
+    log_writer=None,
+    lr_scheduler=None,
+    start_steps: int = 0,
+    lr_schedule_values: Optional[Sequence[float]] = None,
+    ch_names_list: Optional[Sequence] = None,
+    args: Any = None,
+):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -38,15 +39,20 @@ def train_one_epoch(model: torch.nn.Module,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
         
-    if hasattr(model.module, 'quantize'):
+    module = getattr(model, "module", model)
+    quantize = getattr(module, "quantize", None)
+    if quantize is not None:
         try:
-            model.module.quantize.reset_cluster_size(device)
+            quantize.reset_cluster_size(device)
             print("Reset the codebook statistic info in quantizer before each epoch")
-        except:
+        except Exception:
             pass
+    data_loaders: List = list(data_loader_list)
+    ch_names_list = list(ch_names_list) if ch_names_list is not None else [None] * len(data_loaders)
     step_loader = 0
-    for data_loader, ch_names in zip(data_loader_list, ch_names_list):
+    for data_loader, ch_names in zip(data_loaders, ch_names_list):
         input_chans = utils.get_input_chans(ch_names)
+        last_step: Optional[int] = None
         for step, (batch) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
             # assign learning rate & weight decay for each step
             it = start_steps + step + step_loader  # global training iteration
@@ -62,13 +68,15 @@ def train_one_epoch(model: torch.nn.Module,
             loss_value = loss.item()
 
             if not math.isfinite(loss_value):
-                print("Loss is {}, stopping training".format(loss_value), force=True)
-                utils.save_nan_model(args, model)
+                print("Loss is {}, stopping training".format(loss_value), flush=True)
+                save_nan_model = getattr(utils, "save_nan_model", None)
+                if save_nan_model is not None:
+                    save_nan_model(args, model)
                 sys.exit(1)
 
             optimizer.zero_grad()
             # this attribute is added by timm on one optimizer (adahessian)
-            is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+            is_second_order = bool(getattr(optimizer, "is_second_order", False))
             grad_norm = loss_scaler(loss, optimizer, clip_grad=clip_grad,
                                     parameters=model.parameters(), create_graph=is_second_order)
             loss_scale_value = loss_scaler.state_dict()["scale"]
@@ -108,18 +116,22 @@ def train_one_epoch(model: torch.nn.Module,
 
             if lr_scheduler is not None:
                 lr_scheduler.step_update(start_steps + step + step_loader)
-        step_loader += step
+            last_step = step
+        if last_step is not None:
+            step_loader += last_step + 1
+        last_step = None
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     
     # stat the codebook usage information
-    if hasattr(model.module, 'quantize'):
+    if quantize is not None:
         try:
-            codebook_cluster_size = model.module.quantize._codebook.cluster_size
+            codebook_cluster_size = getattr(getattr(quantize, "_codebook", quantize), "cluster_size", None)
         except:
-            codebook_cluster_size = model.module.quantize.cluster_size
-        zero_cnt = (codebook_cluster_size == 0).sum().item()
+            codebook_cluster_size = getattr(quantize, "cluster_size", None)
+        codebook_cluster_size = cast(torch.Tensor, codebook_cluster_size)
+        zero_cnt = int((codebook_cluster_size == 0).sum().item())
         train_stat = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
         train_stat['Unused_code'] = zero_cnt
         print(f"Unused code in codebook: {zero_cnt}")
@@ -127,7 +139,15 @@ def train_one_epoch(model: torch.nn.Module,
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()
-def evaluate(data_loader_list, model, device, log_writer=None, epoch=None, ch_names_list=None, args=None):
+def evaluate(
+    data_loader_list: Iterable,
+    model: torch.nn.Module,
+    device: torch.device,
+    log_writer=None,
+    epoch=None,
+    ch_names_list: Optional[Sequence] = None,
+    args: Any = None,
+):
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Validation:'
@@ -135,14 +155,18 @@ def evaluate(data_loader_list, model, device, log_writer=None, epoch=None, ch_na
     # switch to evaluation mode
     model.eval()
 
-    if hasattr(model.module, 'quantize'):
+    module = getattr(model, "module", model)
+    quantize = getattr(module, "quantize", None)
+    if quantize is not None:
         try:
-            model.module.quantize.reset_cluster_size(device)
+            quantize.reset_cluster_size(device)
             print("Reset the codebook statistic info in quantizer before testing")
-        except:
+        except Exception:
             pass
+    data_loaders: List = list(data_loader_list)
+    ch_names_list = list(ch_names_list) if ch_names_list is not None else [None] * len(data_loaders)
     
-    for data_loader, ch_names in zip(data_loader_list, ch_names_list):
+    for data_loader, ch_names in zip(data_loaders, ch_names_list):
         input_chans = utils.get_input_chans(ch_names)
         for step, (batch) in enumerate(metric_logger.log_every(data_loader, 10, header)):
 
@@ -151,20 +175,22 @@ def evaluate(data_loader_list, model, device, log_writer=None, epoch=None, ch_na
 
             metric_logger.update(loss=loss.item())
 
-            new_log_loss = {k.split('/')[-1]:v for k, v in log_loss.items() if k not in ['total_loss']}
-        metric_logger.update(**new_log_loss)
+            log_loss = log_loss or {}
+            new_log_loss = {k.split('/')[-1]: v for k, v in log_loss.items() if k not in ['total_loss']}
+            metric_logger.update(**new_log_loss)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
 
     # stat the codebook usage information
-    if hasattr(model, 'module') and hasattr(model.module, 'quantize'):
+    if quantize is not None:
         try:
-            codebook_cluster_size = model.module.quantize._codebook.cluster_size
-        except:
-            codebook_cluster_size = model.module.quantize.cluster_size
-        zero_cnt = (codebook_cluster_size == 0).sum().item()
+            codebook_cluster_size = getattr(getattr(quantize, "_codebook", quantize), "cluster_size", None)
+        except Exception:
+            codebook_cluster_size = getattr(quantize, "cluster_size", None)
+        codebook_cluster_size = cast(torch.Tensor, codebook_cluster_size)
+        zero_cnt = int((codebook_cluster_size == 0).sum().item())
         test_stat = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
         test_stat['unused_code'] = zero_cnt
         print(f"Unused code in codebook: {zero_cnt}")
@@ -173,7 +199,14 @@ def evaluate(data_loader_list, model, device, log_writer=None, epoch=None, ch_na
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()
-def calculate_codebook_usage(data_loader, model, device, log_writer=None, epoch=None, args=None):
+def calculate_codebook_usage(
+    data_loader,
+    model,
+    device,
+    log_writer=None,
+    epoch=None,
+    args: Any = None,
+):
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Calculating codebook usage:'
@@ -181,7 +214,7 @@ def calculate_codebook_usage(data_loader, model, device, log_writer=None, epoch=
     # switch to evaluation mode
     model.eval()
     
-    codebook_num = args.codebook_n_emd
+    codebook_num = getattr(args, "codebook_n_emd", 0)
     codebook_cnt = torch.zeros(codebook_num, dtype=torch.float64).to(device)
 
     for step, (images) in enumerate(metric_logger.log_every(data_loader, 10, header)):
@@ -192,9 +225,10 @@ def calculate_codebook_usage(data_loader, model, device, log_writer=None, epoch=
         outputs_gather_list = [torch.zeros_like(outputs) for _ in range(utils.get_world_size())]
         torch.distributed.all_gather(outputs_gather_list, outputs)
         all_tokens = torch.cat(outputs_gather_list, dim=0).view(-1) # [B * N * Ngpu, ]
-        
+
         codebook_cnt += torch.bincount(all_tokens, minlength=codebook_num)
 
     # statistic
-    zero_cnt = (codebook_cnt == 0).sum() # 0
-    print(f"STAT:  {zero_cnt} tokens ({(zero_cnt / codebook_num) * 100}%) never are used in this codebook.")
+    zero_cnt = int((codebook_cnt == 0).sum().item()) if codebook_num > 0 else 0
+    percentage = (zero_cnt / codebook_num) * 100 if codebook_num > 0 else 0.0
+    print(f"STAT:  {zero_cnt} tokens ({percentage:.2f}%) never are used in this codebook.")

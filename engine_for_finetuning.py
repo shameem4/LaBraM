@@ -7,13 +7,25 @@
 # https://github.com/facebookresearch/deit/
 # https://github.com/facebookresearch/dino
 # ---------------------------------------------------------
+# pyright: reportCallIssue=false
+
 import math
 import sys
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence, Protocol, cast
+
 import torch
-from timm.utils import ModelEma
-import utils
 from einops import rearrange
+from timm.utils.model_ema import ModelEma
+
+import utils
+
+
+class LossScaler(Protocol):
+    def __call__(self, loss: torch.Tensor, optimizer: torch.optim.Optimizer, **kwargs) -> Any:
+        ...
+
+    def state_dict(self) -> dict:
+        ...
 
 def train_class_batch(model, samples, target, criterion, ch_names):
     outputs = model(samples, ch_names)
@@ -26,12 +38,25 @@ def get_loss_scale_for_deepspeed(model):
     return optimizer.loss_scale if hasattr(optimizer, "loss_scale") else optimizer.cur_scale
 
 
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    model_ema: Optional[ModelEma] = None, log_writer=None,
-                    start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
-                    num_training_steps_per_epoch=None, update_freq=None, ch_names=None, is_binary=True):
+def train_one_epoch(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    data_loader: Iterable,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    loss_scaler: Optional[LossScaler],
+    max_norm: float = 0,
+    model_ema: Optional[ModelEma] = None,
+    log_writer=None,
+    start_steps: int = 0,
+    lr_schedule_values: Optional[Sequence[float]] = None,
+    wd_schedule_values: Optional[Sequence[float]] = None,
+    num_training_steps_per_epoch: Optional[int] = None,
+    update_freq: int = 1,
+    ch_names: Optional[Sequence[str]] = None,
+    is_binary: bool = True,
+):
     input_chans = None
     if ch_names is not None:
         input_chans = utils.get_input_chans(ch_names)
@@ -42,19 +67,21 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
+    update_freq = max(update_freq, 1)
+    start_steps = start_steps or 0
     if loss_scaler is None:
         model.zero_grad()
-        model.micro_steps = 0
+        cast(Any, model).micro_steps = 0
     else:
         optimizer.zero_grad()
 
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         step = data_iter_step // update_freq
-        if step >= num_training_steps_per_epoch:
+        if num_training_steps_per_epoch is not None and step >= num_training_steps_per_epoch:
             continue
         it = start_steps + step  # global training iteration
-        # Update LR & WD for the first acc
-        if lr_schedule_values is not None or wd_schedule_values is not None and data_iter_step % update_freq == 0:
+        # Update LR & WD per accumulation cycle
+        if (lr_schedule_values is not None or wd_schedule_values is not None) and data_iter_step % update_freq == 0:
             for i, param_group in enumerate(optimizer.param_groups):
                 if lr_schedule_values is not None:
                     param_group["lr"] = lr_schedule_values[it] * param_group.get("lr_scale", 1.0)
@@ -89,20 +116,24 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             model.step()
 
             if (data_iter_step + 1) % update_freq == 0:
-                # model.zero_grad()
-                # Deepspeed will call step() & model.zero_grad() automatic
                 if model_ema is not None:
                     model_ema.update(model)
             grad_norm = None
             loss_scale_value = get_loss_scale_for_deepspeed(model)
         else:
             # this attribute is added by timm on one optimizer (adahessian)
-            is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
+            is_second_order = bool(getattr(optimizer, "is_second_order", False))
             loss /= update_freq
-            grad_norm = loss_scaler(loss, optimizer, clip_grad=max_norm,
-                                    parameters=model.parameters(), create_graph=is_second_order,
-                                    update_grad=(data_iter_step + 1) % update_freq == 0)
-            if (data_iter_step + 1) % update_freq == 0:
+            should_update = (data_iter_step + 1) % update_freq == 0
+            grad_norm = loss_scaler(
+                loss,
+                optimizer,
+                clip_grad=max_norm,
+                parameters=model.parameters(),
+                create_graph=is_second_order,
+                update_grad=should_update,
+            )
+            if should_update:
                 optimizer.zero_grad()
                 if model_ema is not None:
                     model_ema.update(model)

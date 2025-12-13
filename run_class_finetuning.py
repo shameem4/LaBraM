@@ -7,29 +7,39 @@
 # https://github.com/facebookresearch/deit/
 # https://github.com/facebookresearch/dino
 # ---------------------------------------------------------
+# pyright: reportCallIssue=false
 
 import argparse
 import datetime
-import numpy as np
-import time
-import torch
-import torch.backends.cudnn as cudnn
 import json
 import os
-
-from pathlib import Path
+import time
 from collections import OrderedDict
-from timm.data.mixup import Mixup
+from pathlib import Path
+from typing import Any, Iterable, List, Optional, Sequence, Sized, Tuple, cast
+
+import importlib
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+from torch.utils.data import Dataset, DistributedSampler, Sampler, SequentialSampler
+
+from scipy import interpolate
 from timm.models import create_model
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
-from timm.utils import ModelEma
-from optim_factory import create_optimizer, get_parameter_groups, LayerDecayValueAssigner
+from timm.loss.cross_entropy import LabelSmoothingCrossEntropy
+from timm.utils.model_ema import ModelEma
 
 from engine_for_finetuning import train_one_epoch, evaluate
+from optim_factory import create_optimizer, get_parameter_groups, LayerDecayValueAssigner
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import utils
-from scipy import interpolate
-import modeling_finetune
+
+DatasetType = Dataset
+DatasetSequence = Sequence[DatasetType]
+
+
+def _sized(dataset: DatasetType) -> Sized:
+    return cast(Sized, dataset)
 
 def get_args():
     parser = argparse.ArgumentParser('LaBraM fine-tuning and evaluation script for EEG classification', add_help=False)
@@ -177,11 +187,10 @@ def get_args():
 
     if known_args.enable_deepspeed:
         try:
-            import deepspeed
-            from deepspeed import DeepSpeedConfig
-            parser = deepspeed.add_config_arguments(parser)
-            ds_init = deepspeed.initialize
-        except:
+            deepspeed_module = importlib.import_module("deepspeed")
+            parser = getattr(deepspeed_module, "add_config_arguments")(parser)
+            ds_init = getattr(deepspeed_module, "initialize")
+        except (ImportError, AttributeError):
             print("Please 'pip install deepspeed==0.4.0'")
             exit(0)
     else:
@@ -209,22 +218,26 @@ def get_models(args):
     return model
 
 
-def get_dataset(args):
+def get_dataset(args) -> Tuple[DatasetType, DatasetSequence, DatasetType, Sequence[str], Sequence[str]]:
     if args.dataset == 'TUAB':
         train_dataset, test_dataset, val_dataset = utils.prepare_TUAB_dataset("path/to/TUAB")
-        ch_names = ['EEG FP1', 'EEG FP2-REF', 'EEG F3-REF', 'EEG F4-REF', 'EEG C3-REF', 'EEG C4-REF', 'EEG P3-REF', 'EEG P4-REF', 'EEG O1-REF', 'EEG O2-REF', 'EEG F7-REF', \
+        ch_names = ['EEG FP1', 'EEG FP2-REF', 'EEG F3-REF', 'EEG F4-REF', 'EEG C3-REF', 'EEG C4-REF', 'EEG P3-REF', 'EEG P4-REF', 'EEG O1-REF', 'EEG O2-REF', 'EEG F7-REF',
                     'EEG F8-REF', 'EEG T3-REF', 'EEG T4-REF', 'EEG T5-REF', 'EEG T6-REF', 'EEG A1-REF', 'EEG A2-REF', 'EEG FZ-REF', 'EEG CZ-REF', 'EEG PZ-REF', 'EEG T1-REF', 'EEG T2-REF']
         ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
         args.nb_classes = 1
         metrics = ["pr_auc", "roc_auc", "accuracy", "balanced_accuracy"]
     elif args.dataset == 'TUEV':
         train_dataset, test_dataset, val_dataset = utils.prepare_TUEV_dataset("path/to/TUEV")
-        ch_names = ['EEG FP1-REF', 'EEG FP2-REF', 'EEG F3-REF', 'EEG F4-REF', 'EEG C3-REF', 'EEG C4-REF', 'EEG P3-REF', 'EEG P4-REF', 'EEG O1-REF', 'EEG O2-REF', 'EEG F7-REF', \
+        ch_names = ['EEG FP1-REF', 'EEG FP2-REF', 'EEG F3-REF', 'EEG F4-REF', 'EEG C3-REF', 'EEG C4-REF', 'EEG P3-REF', 'EEG P4-REF', 'EEG O1-REF', 'EEG O2-REF', 'EEG F7-REF',
                     'EEG F8-REF', 'EEG T3-REF', 'EEG T4-REF', 'EEG T5-REF', 'EEG T6-REF', 'EEG A1-REF', 'EEG A2-REF', 'EEG FZ-REF', 'EEG CZ-REF', 'EEG PZ-REF', 'EEG T1-REF', 'EEG T2-REF']
         ch_names = [name.split(' ')[-1].split('-')[0] for name in ch_names]
         args.nb_classes = 6
         metrics = ["accuracy", "balanced_accuracy", "cohen_kappa", "f1_weighted"]
-    return train_dataset, test_dataset, val_dataset, ch_names, metrics
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
+    dataset_test = test_dataset if isinstance(test_dataset, list) else [test_dataset]
+    return train_dataset, dataset_test, val_dataset, ch_names, metrics
 
 
 def main(args, ds_init):
@@ -248,40 +261,40 @@ def main(args, ds_init):
     # dataset_train, dataset_test, dataset_val: follows the standard format of torch.utils.data.Dataset.
     # ch_names: list of strings, channel names of the dataset. It should be in capital letters.
     # metrics: list of strings, the metrics you want to use. We utilize PyHealth to implement it.
-    dataset_train, dataset_test, dataset_val, ch_names, metrics = get_dataset(args)
+    dataset_train, dataset_test_seq, dataset_val, ch_names, metrics = get_dataset(args)
 
     if args.disable_eval_during_finetuning:
         dataset_val = None
-        dataset_test = None
+        dataset_test_seq = []
 
-    if True:  # args.distributed:
-        num_tasks = utils.get_world_size()
-        global_rank = utils.get_rank()
-        sampler_train = torch.utils.data.DistributedSampler(
-            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-        )
-        print("Sampler_train = %s" % str(sampler_train))
-        if args.dist_eval:
-            assert dataset_val is not None and dataset_test is not None
-            if len(dataset_val) % num_tasks != 0:
-                print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-                      'This will slightly alter validation results as extra duplicate entries are added to achieve '
-                      'equal num of samples per-process.')
-            sampler_val = torch.utils.data.DistributedSampler(
-                dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-            if type(dataset_test) == list:
-                sampler_test = [torch.utils.data.DistributedSampler(
-                    dataset, num_replicas=num_tasks, rank=global_rank, shuffle=False) for dataset in dataset_test]
-            else:
-                sampler_test = torch.utils.data.DistributedSampler(
-                    dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-        else:
-            assert dataset_val is not None and dataset_test is not None
-            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-            sampler_test = torch.utils.data.SequentialSampler(dataset_test)
+    num_tasks = utils.get_world_size()
+    global_rank = utils.get_rank()
+    sampler_train = DistributedSampler(
+        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+    )
+    print("Sampler_train = %s" % str(sampler_train))
+    sampler_val: Optional[Sampler] = None
+    sampler_test_seq: List[Sampler] = []
+    if args.dist_eval and dataset_val is not None and dataset_test_seq:
+        if len(_sized(dataset_val)) % num_tasks != 0:
+            print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
+                  'This will slightly alter validation results as extra duplicate entries are added to achieve '
+                  'equal num of samples per-process.')
+        sampler_val = cast(Sampler, DistributedSampler(
+            cast(Any, dataset_val), num_replicas=num_tasks, rank=global_rank, shuffle=False))
+        sampler_test_seq = [
+            cast(Sampler, DistributedSampler(
+                cast(Any, dataset), num_replicas=num_tasks, rank=global_rank, shuffle=False))
+            for dataset in dataset_test_seq
+        ]
     else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+        if dataset_val is not None:
+            sampler_val = cast(Sampler, SequentialSampler(cast(Any, dataset_val)))
+        sampler_test_seq = [
+            cast(Sampler, SequentialSampler(cast(Any, dataset))) for dataset in dataset_test_seq
+        ]
+    if sampler_val is None:
+        sampler_val = SequentialSampler(cast(Any, dataset_train))
 
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
@@ -297,6 +310,8 @@ def main(args, ds_init):
         drop_last=True,
     )
 
+    data_loader_val = None
+    data_loader_test: List[torch.utils.data.DataLoader] = []
     if dataset_val is not None:
         data_loader_val = torch.utils.data.DataLoader(
             dataset_val, sampler=sampler_val,
@@ -305,25 +320,15 @@ def main(args, ds_init):
             pin_memory=args.pin_mem,
             drop_last=False
         )
-        if type(dataset_test) == list:
-            data_loader_test = [torch.utils.data.DataLoader(
+        data_loader_test = [
+            torch.utils.data.DataLoader(
                 dataset, sampler=sampler,
                 batch_size=int(1.5 * args.batch_size),
                 num_workers=args.num_workers,
                 pin_memory=args.pin_mem,
                 drop_last=False
-            ) for dataset, sampler in zip(dataset_test, sampler_test)]
-        else:
-            data_loader_test = torch.utils.data.DataLoader(
-                dataset_test, sampler=sampler_test,
-                batch_size=int(1.5 * args.batch_size),
-                num_workers=args.num_workers,
-                pin_memory=args.pin_mem,
-                drop_last=False
-            )
-    else:
-        data_loader_val = None
-        data_loader_test = None
+            ) for dataset, sampler in zip(dataset_test_seq, sampler_test_seq)
+        ]
 
     model = get_models(args)
 
@@ -383,18 +388,18 @@ def main(args, ds_init):
             resume='')
         print("Using EMA with decay = %.8f" % args.model_ema_decay)
 
-    model_without_ddp = model
+    model_without_ddp = cast(torch.nn.Module, model)
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     print("Model = %s" % str(model_without_ddp))
     print('number of params:', n_parameters)
 
     total_batch_size = args.batch_size * args.update_freq * utils.get_world_size()
-    num_training_steps_per_epoch = len(dataset_train) // total_batch_size
+    num_training_steps_per_epoch = len(_sized(dataset_train)) // total_batch_size
     print("LR = %.8f" % args.lr)
     print("Batch size = %d" % total_batch_size)
     print("Update frequent = %d" % args.update_freq)
-    print("Number of training examples = %d" % len(dataset_train))
+    print("Number of training examples = %d" % len(_sized(dataset_train)))
     print("Number of training training per epoch = %d" % num_training_steps_per_epoch)
 
     num_layers = model_without_ddp.get_num_layers()
@@ -439,10 +444,12 @@ def main(args, ds_init):
         args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
         warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
     )
+    lr_schedule_values = [float(value) for value in lr_schedule_values]
     if args.weight_decay_end is None:
         args.weight_decay_end = args.weight_decay
     wd_schedule_values = utils.cosine_scheduler(
         args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
+    wd_schedule_values = [float(value) for value in wd_schedule_values]
     print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
     if args.nb_classes == 1:
@@ -474,7 +481,9 @@ def main(args, ds_init):
     max_accuracy_test = 0.0
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
+            train_sampler_obj = data_loader_train.sampler
+            if isinstance(train_sampler_obj, DistributedSampler):
+                train_sampler_obj.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
         train_stats = train_one_epoch(
@@ -493,9 +502,12 @@ def main(args, ds_init):
             
         if data_loader_val is not None:
             val_stats = evaluate(data_loader_val, model, device, header='Val:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
-            print(f"Accuracy of the network on the {len(dataset_val)} val EEG: {val_stats['accuracy']:.2f}%")
+            assert dataset_val is not None
+            val_count = len(_sized(dataset_val))
+            test_count = sum(len(_sized(dataset)) for dataset in dataset_test_seq)
+            print(f"Accuracy of the network on the {val_count} val EEG: {val_stats['accuracy']:.2f}%")
             test_stats = evaluate(data_loader_test, model, device, header='Test:', ch_names=ch_names, metrics=metrics, is_binary=args.nb_classes == 1)
-            print(f"Accuracy of the network on the {len(dataset_test)} test EEG: {test_stats['accuracy']:.2f}%")
+            print(f"Accuracy of the network on the {test_count} test EEG: {test_stats['accuracy']:.2f}%")
             
             if max_accuracy < val_stats["accuracy"]:
                 max_accuracy = val_stats["accuracy"]

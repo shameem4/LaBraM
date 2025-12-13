@@ -8,17 +8,30 @@
 # https://github.com/facebookresearch/dino
 # ---------------------------------------------------------
 
+# pyright: reportCallIssue=false
+
 import math
 import sys
-from typing import Iterable
+from typing import Any, Iterable, Optional, Protocol, Sequence, Tuple, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 
 import utils
 from einops import rearrange
 from contextlib import nullcontext
+
+_AUTOCAST = cast(Any, autocast)
+
+
+class LossScaler(Protocol):
+    def __call__(self, loss: torch.Tensor, optimizer: torch.optim.Optimizer, **kwargs) -> Any:
+        ...
+
+    def state_dict(self) -> dict:
+        ...
 
 def random_masking(x, mask_ratio):
         """
@@ -53,11 +66,23 @@ def random_masking(x, mask_ratio):
         return mask.to(torch.bool)
 
 
-def train_one_epoch(model: torch.nn.Module, vqnsp: torch.nn.Module,
-                    data_loader_list: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    log_writer=None, lr_scheduler=None, start_steps=None,
-                    lr_schedule_values=None, wd_schedule_values=None, ch_names_list=None, args=None):
+def train_one_epoch(
+    model: torch.nn.Module,
+    vqnsp: torch.nn.Module,
+    data_loader_list: Iterable,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    loss_scaler: LossScaler,
+    max_norm: float = 0,
+    log_writer=None,
+    lr_scheduler=None,
+    start_steps: Optional[int] = 0,
+    lr_schedule_values: Optional[Sequence[float]] = None,
+    wd_schedule_values: Optional[Sequence[float]] = None,
+    ch_names_list: Optional[Sequence] = None,
+    args: Any = None,
+):
     model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -67,18 +92,22 @@ def train_one_epoch(model: torch.nn.Module, vqnsp: torch.nn.Module,
 
     loss_fn = nn.CrossEntropyLoss()
 
+    grad_steps = getattr(args, "gradient_accumulation_steps", 1) or 1
     step_loader = 0
-    for data_loader, ch_names in zip(data_loader_list, ch_names_list):
+    data_loaders = list(data_loader_list)
+    ch_names_list = list(ch_names_list) if ch_names_list is not None else [None] * len(data_loaders)
+    for data_loader, ch_names in zip(data_loaders, ch_names_list):
         if len(data_loader) == 0:
             continue
         input_chans = utils.get_input_chans(ch_names)
-        for step, (batch) in enumerate(metric_logger.log_every(data_loader, print_freq * args.gradient_accumulation_steps, header)):
+        loader_steps = 0
+        for step, (batch) in enumerate(metric_logger.log_every(data_loader, print_freq * grad_steps, header)):
             # assign learning rate & weight decay for each step
-            it = start_steps + step + step_loader  # global training iteration
+            it = (start_steps or 0) + step + step_loader  # global training iteration
             if lr_schedule_values is not None or wd_schedule_values is not None:
                 for i, param_group in enumerate(optimizer.param_groups):
                     if lr_schedule_values is not None:
-                        param_group["lr"] = lr_schedule_values[it] * param_group["lr_scale"]
+                        param_group["lr"] = lr_schedule_values[it] * param_group.get("lr_scale", 1.0)
                     if wd_schedule_values is not None and param_group["weight_decay"] > 0:
                         param_group["weight_decay"] = wd_schedule_values[it]
 
@@ -88,15 +117,20 @@ def train_one_epoch(model: torch.nn.Module, vqnsp: torch.nn.Module,
             bool_masked_pos = random_masking(samples.flatten(1, 2), mask_ratio=0.5).to(device, non_blocking=True)
 
             with torch.no_grad():
-                with torch.cuda.amp.autocast():
+                with _AUTOCAST():  # type: ignore[reportCallIssue]
                     input_ids = vqnsp.get_codebook_indices(samples, input_chans)
 
                 labels = input_ids[bool_masked_pos]
                 labels_sym = input_ids[~bool_masked_pos]
 
-            my_context = model.no_sync if args.distributed and (step + 1) % args.gradient_accumulation_steps != 0 else nullcontext
+            distributed = getattr(args, "distributed", False)
+            my_context = (
+                model.no_sync
+                if distributed and (step + 1) % grad_steps != 0
+                else nullcontext
+            )
             with my_context():
-                with torch.cuda.amp.autocast(): # enabled=False
+                with _AUTOCAST():  # enabled=False  # type: ignore[reportCallIssue]
                     outputs = model(samples, input_chans, bool_masked_pos=bool_masked_pos)
 
                     x_rec, x_rec_sym = outputs
@@ -107,17 +141,23 @@ def train_one_epoch(model: torch.nn.Module, vqnsp: torch.nn.Module,
             loss_value = loss.item()
 
             if not math.isfinite(loss_value):
-                print(f"Loss is {loss_value}, stopping training at rank {utils.get_rank()}", force=True)
-                
+                print(f"Loss is {loss_value}, stopping training at rank {utils.get_rank()}", flush=True)
                 sys.exit(1)
 
             # this attribute is added by timm on one optimizer (adahessian)
-            is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-            loss /= args.gradient_accumulation_steps
-            grad_norm = loss_scaler(loss, optimizer, clip_grad=max_norm,
-                                    parameters=model.parameters(), create_graph=is_second_order, update_grad=(step + 1) % args.gradient_accumulation_steps == 0)
+            is_second_order = bool(getattr(optimizer, "is_second_order", False))
+            loss /= grad_steps
+            should_update = (step + 1) % grad_steps == 0
+            grad_norm = loss_scaler(
+                loss,
+                optimizer,
+                clip_grad=max_norm,
+                parameters=model.parameters(),
+                create_graph=is_second_order,
+                update_grad=should_update,
+            )
             loss_scale_value = loss_scaler.state_dict()["scale"]
-            if (step + 1) % args.gradient_accumulation_steps == 0:
+            if should_update:
                 optimizer.zero_grad()
 
             torch.cuda.synchronize()
@@ -160,11 +200,11 @@ def train_one_epoch(model: torch.nn.Module, vqnsp: torch.nn.Module,
 
                 log_writer.set_step()
 
-            if lr_scheduler is not None:
-                lr_scheduler.step_update(start_steps + step + step_loader)
-        step_loader += step
+            if lr_scheduler is not None and should_update:
+                lr_scheduler.step_update((start_steps or 0) + step + step_loader)
+            loader_steps = step
+        step_loader += loader_steps + 1
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
