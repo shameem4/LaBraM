@@ -4,7 +4,7 @@ This document explains how EEG data moves through the LaBraM codebase and
 describes the responsibility of each major file. Use it as the first stop
 when planning training, fine-tuning, or deployment changes.
 
-## End-to-End Data, Training, and Inference Flow
+## End-to-End Data & Training Flow
 
 ```
 Raw EEG (EDF/BDF/CNT ...)
@@ -32,16 +32,39 @@ Raw EEG (EDF/BDF/CNT ...)
                ↳ modeling_finetune.NeuralTransformer consumes raw EEG patches
                ↳ Saves downstream heads (classification / regression)
 
-   Deployment / inference:
-      • run_class_finetuning.py --eval --finetune <checkpoint>
-         ↳ Loads pretrained weights (teacher/student) via utils.load_state_dict()
-         ↳ Builds DataLoader with same channel map
-         ↳ engine_for_finetuning.evaluate() runs forward-only pass, aggregates metrics
-      • For bespoke apps export modeling_finetune.NeuralTransformer via torch.jit
-         or ONNX: instantiate model, load checkpoint, call model.eval(), then
-         trace with sample tensor shaped [batch, channels, windows, patch]
-      • Optional streaming: feed rolling windows through TemporalConv front-end
-         and reuse cached hidden states if implemented downstream
+```
+
+## End-to-End Inference / Deployment Flow
+
+```
+Raw EEG stream or archives (EDF/BDF/CNT, sensor packets)
+   │
+   ├─► Lightweight preprocessing
+   │       • Apply same channel pruning/filtering/resampling rules as training
+   │       • Segment into 200-sample patches (sliding window for streaming)
+   │
+   ├─► Dataset wrapper
+   │       • utils.prepare_*() for offline eval (TUAB/TUEV, etc.)
+   │       • Custom Dataset for streaming sensors (ensure channel ordering)
+   │
+   ├─► Model bootstrap
+   │       • Instantiate modeling_finetune.LaBraM variant via timm.create_model()
+   │       • Load checkpoint (finetuned or pretrained) with utils.load_state_dict()
+   │       • Call model.eval(); optionally torch.jit.trace / torch.onnx.export
+   │
+   ├─► Execution paths
+   │       • Offline metrics: run_class_finetuning.py --eval --finetune ckpt →
+   │             engine_for_finetuning.evaluate() for BCE/CE metrics
+   │       • Batch inference: simple script loads Dataset/DataLoader,
+   │             loops over batches, collects logits/probabilities
+   │       • Streaming/mobile: feed rolling windows (B×N×A×T) through
+   │             TemporalConv front-end, keep channel map fixed, optionally
+   │             cache hidden states for overlap-save style latency reduction
+   │
+   └─► Outputs
+           • Classification logits / probabilities per window
+           • Optional intermediate features via model.forward_features()
+           • Serialized artifacts: TorchScript, ONNX, or CoreML for deployment
 ```
 
 ### Control Signals & Decisions
