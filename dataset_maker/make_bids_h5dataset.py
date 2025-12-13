@@ -26,10 +26,16 @@ import argparse
 import json
 import logging
 from pathlib import Path
+import sys
 from typing import Iterable, List, Optional, Sequence
 
 import numpy as np
 from mne_bids import BIDSPath, get_entity_vals, read_raw_bids
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from dataset_maker.shock.utils.h5 import h5Dataset
 from dataset_maker.shock.utils.eegUtils import preprocessing_edf
@@ -115,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-level",
         type=str,
-        default="INFO",
+        default="ERROR",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
@@ -138,25 +144,13 @@ def load_channel_template(path: Optional[Path]) -> Optional[List[str]]:
 
 
 def iter_bids_paths(bids_root: Path) -> Iterable[BIDSPath]:
-    subjects = get_entity_vals(bids_root, "subject")
-    for subject in subjects:
-        sessions = get_entity_vals(bids_root, "session", subject=subject) or [None]
-        for session in sessions:
-            tasks = get_entity_vals(bids_root, "task", subject=subject, session=session) or [None]
-            runs = get_entity_vals(bids_root, "run", subject=subject, session=session) or [None]
-            for task in tasks:
-                for run in runs:
-                    template = BIDSPath(
-                        subject=subject,
-                        session=session,
-                        task=task,
-                        run=run,
-                        datatype="eeg",
-                        suffix="eeg",
-                        root=bids_root,
-                    )
-                    for match in template.match():
-                        yield match
+    template = BIDSPath(root=bids_root, datatype="eeg", suffix="eeg")
+    matches = template.match()
+    if not matches:
+        LOGGER.warning("No EEG files found under %s", bids_root)
+        return []
+    for match in matches:
+        yield match
 
 
 def apply_standard_preprocessing(raw, l_freq: float, h_freq: float, notch_freq: float, resample: int):
@@ -218,6 +212,9 @@ def main():
     total_bytes = 0
     for bids_path in iter_bids_paths(args.bids_root):
         LOGGER.info("Processing %s", bids_path.basename)
+        if not bids_path.fpath.exists():
+            LOGGER.warning("Skipping %s because file is missing (%s)", bids_path.basename, bids_path.fpath)
+            continue
         try:
             eeg_data, ch_names = preprocess_recording(
                 bids_path,
