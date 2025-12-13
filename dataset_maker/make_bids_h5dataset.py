@@ -110,6 +110,19 @@ def parse_args() -> argparse.Namespace:
         help="Destination folder for generated .hdf5 files",
     )
     parser.add_argument(
+        "--save-in-derivatives",
+        dest="save_in_derivatives",
+        action="store_true",
+        default=True,
+        help="Write the resulting HDF5 under the BIDS root's `derivatives` folder (default; keeps output on the same drive).",
+    )
+    parser.add_argument(
+        "--no-save-in-derivatives",
+        dest="save_in_derivatives",
+        action="store_false",
+        help="Respect `--output-dir` instead of the BIDS dataset's `derivatives` directory.",
+    )
+    parser.add_argument(
         "--dataset-name",
         type=str,
         default="labram_bids",
@@ -181,7 +194,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-datasets",
         type=int,
-        default=1,
+        default=None,
         help="Stop after processing this many discovered datasets (debug helper)",
     )
     parser.add_argument(
@@ -597,14 +610,17 @@ def main():
             print(f"[{idx}] {root}")
         return
 
-    output_file = args.output_dir / f"{args.dataset_name}.hdf5"
+    output_dir = args.output_dir
+    if args.save_in_derivatives:
+        output_dir = args.bids_root / "derivatives"
+    output_file = output_dir / f"{args.dataset_name}.hdf5"
     if not args.dry_run:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
         if output_file.exists() and not args.overwrite:
             raise FileExistsError(f"{output_file} already exists. Use --overwrite to replace it.")
 
     channel_template = load_channel_template(args.channel_template)
-    dataset = None if args.dry_run else h5Dataset(args.output_dir, args.dataset_name)
+    dataset = None if args.dry_run else h5Dataset(output_dir, args.dataset_name)
 
     processed = 0
     chunks = None
