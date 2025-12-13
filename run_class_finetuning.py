@@ -10,7 +10,6 @@
 
 import argparse
 import datetime
-from pyexpat import model
 import numpy as np
 import time
 import torch
@@ -263,6 +262,7 @@ def main(args, ds_init):
         )
         print("Sampler_train = %s" % str(sampler_train))
         if args.dist_eval:
+            assert dataset_val is not None and dataset_test is not None
             if len(dataset_val) % num_tasks != 0:
                 print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
                       'This will slightly alter validation results as extra duplicate entries are added to achieve '
@@ -276,6 +276,7 @@ def main(args, ds_init):
                 sampler_test = torch.utils.data.DistributedSampler(
                     dataset_test, num_replicas=num_tasks, rank=global_rank, shuffle=False)
         else:
+            assert dataset_val is not None and dataset_test is not None
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
             sampler_test = torch.utils.data.SequentialSampler(dataset_test)
     else:

@@ -11,16 +11,16 @@ def preprocessing_cnt(cntFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=200):
         raw.drop_channels(['ECG'])
 
     # filtering
-    raw = raw.filter(l_freq=l_freq, h_freq=h_freq)
-    raw = raw.notch_filter(50.0)
+    raw.filter(l_freq=l_freq, h_freq=h_freq)
+    raw.notch_filter(50.0)  # type: ignore[union-attr]
     # downsampling
-    raw = raw.resample(sfreq, n_jobs=5)
-    eegData = raw.get_data(units='uV')
+    raw.resample(sfreq, n_jobs=5)
+    eegData = raw.get_data(units='uV')  # type: ignore[call-overload]
 
     return eegData, raw.ch_names
 
 
-def preprocessing_edf(edfFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=200, drop_channels: list=None, standard_channels: list=None):
+def preprocessing_edf(edfFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=200, drop_channels=None, standard_channels=None):
     # reading edf
     raw = mne.io.read_raw_edf(edfFilePath, preload=True)
     if drop_channels is not None:
@@ -37,11 +37,11 @@ def preprocessing_edf(edfFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=200, drop_
             return None, ['a']
 
     # filtering
-    raw = raw.filter(l_freq=l_freq, h_freq=h_freq)
-    raw = raw.notch_filter(50.0)
+    raw.filter(l_freq=l_freq, h_freq=h_freq)
+    raw.notch_filter(50.0)  # type: ignore[union-attr]
     # downsampling
-    raw = raw.resample(sfreq, n_jobs=5)
-    eegData = raw.get_data(units='uV')
+    raw.resample(sfreq, n_jobs=5)
+    eegData = raw.get_data(units='uV')  # type: ignore[call-overload]
 
     return eegData, raw.ch_names
 
@@ -49,13 +49,14 @@ def preprocessing_edf(edfFilePath, l_freq=0.1, h_freq=75.0, sfreq:int=200, drop_
 def readh5(h5filePath):
     with h5py.File('matrix.h5', 'r', libver='latest', swmr=True) as f:
         dset = f['data']
+        assert isinstance(dset, h5py.Dataset)
         shape = dset.shape
         dtype = dset.dtype
 
         if dset.chunks:
             np_array = np.empty(shape, dtype=dtype)
             dset.read_direct(np_array)
-        else: 
+        else:
             np_array = dset[()]
     return np_array
 

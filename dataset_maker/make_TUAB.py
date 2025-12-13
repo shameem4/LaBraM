@@ -66,8 +66,8 @@ def split_and_dump(params):
                 raw.resample(200, n_jobs=5)
 
                 ch_name = raw.ch_names
-                raw_data = raw.get_data(units='uV')
-                channeled_data = raw_data.copy()
+                raw_data = raw.get_data(units='uV')  # type: ignore[call-overload]
+                channeled_data = raw_data.copy()  # type: ignore[union-attr]
             except:
                 with open("tuab-process-error-files.txt", "a") as f:
                     f.write(file + "\n")

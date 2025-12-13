@@ -19,7 +19,7 @@ for cntFile in group:
     print(f'processing {cntFile.name}')
     eegData, chOrder = preprocessing_cnt(cntFile, l_freq, h_freq, rsfreq)
     chOrder = [s.upper() for s in chOrder]
-    eegData = eegData[:, :-10*rsfreq]
+    eegData = eegData[:, :-10*rsfreq]  # type: ignore[index]
     grp = dataset.addGroup(grpName=cntFile.stem)
     dset = dataset.addDataset(grp, 'eeg', eegData, chunks)
 

@@ -10,7 +10,7 @@ class h5Dataset:
     def addGroup(self, grpName:str):
         return self.__f.create_group(grpName)
     
-    def addDataset(self, grp:h5py.Group, dsName:str, arr:np.array, chunks:tuple):
+    def addDataset(self, grp:h5py.Group, dsName:str, arr:np.ndarray, chunks:tuple):
         return grp.create_dataset(dsName, data=arr, chunks=chunks)
     
     def addAttributes(self, src:'h5py.Dataset|h5py.Group', attrName:str, attrValue):

@@ -1,8 +1,10 @@
 import h5py
 import bisect
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from torch.utils.data import Dataset
+import numpy as np
+from numpy.typing import NDArray
 
 
 list_path = List[Path]
@@ -25,9 +27,9 @@ class SingleShockDataset(Dataset):
         self.__start_percentage = start_percentage
         self.__end_percentage = end_percentage
 
-        self.__file = None
-        self.__length = None
-        self.__feature_size = None
+        self.__file: Optional[h5py.File] = None
+        self.__length: int = 0
+        self.__feature_size: Optional[List[int]] = None
 
         self.__subjects = []
         self.__global_idxes = []
@@ -42,7 +44,11 @@ class SingleShockDataset(Dataset):
         global_idx = 0
         for subject in self.__subjects:
             self.__global_idxes.append(global_idx) # the start index of the subject's sample in the dataset
-            subject_len = self.__file[subject]['eeg'].shape[1]
+            subject_grp = self.__file[subject]
+            assert isinstance(subject_grp, h5py.Group)
+            eeg_dataset = subject_grp['eeg']
+            assert isinstance(eeg_dataset, h5py.Dataset)
+            subject_len: int = eeg_dataset.shape[1]
             # total number of samples
             total_sample_num = (subject_len-self.__window_size) // self.__stride_size + 1
             # cut out part of samples
@@ -53,20 +59,29 @@ class SingleShockDataset(Dataset):
             global_idx += (end_idx - start_idx) // self.__stride_size + 1
         self.__length = global_idx
 
-        self.__feature_size = [i for i in self.__file[self.__subjects[0]]['eeg'].shape]
+        first_subject = self.__file[self.__subjects[0]]
+        assert isinstance(first_subject, h5py.Group)
+        first_eeg = first_subject['eeg']
+        assert isinstance(first_eeg, h5py.Dataset)
+        self.__feature_size = [i for i in first_eeg.shape]
         self.__feature_size[1] = self.__window_size
 
     @property
-    def feature_size(self):
+    def feature_size(self) -> Optional[List[int]]:
         return self.__feature_size
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.__length
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int) -> NDArray[np.floating]:
         subject_idx = bisect.bisect(self.__global_idxes, idx) - 1
         item_start_idx = (idx - self.__global_idxes[subject_idx]) * self.__stride_size + self.__local_idxes[subject_idx]
-        return self.__file[self.__subjects[subject_idx]]['eeg'][:, item_start_idx:item_start_idx+self.__window_size]
+        assert self.__file is not None
+        subject_grp = self.__file[self.__subjects[subject_idx]]
+        assert isinstance(subject_grp, h5py.Group)
+        eeg_data = subject_grp['eeg']
+        assert isinstance(eeg_data, h5py.Dataset)
+        return eeg_data[:, item_start_idx:item_start_idx+self.__window_size]
     
     def free(self) -> None: 
         if self.__file:
@@ -74,7 +89,12 @@ class SingleShockDataset(Dataset):
             self.__file = None
     
     def get_ch_names(self):
-        return self.__file[self.__subjects[0]]['eeg'].attrs['chOrder']
+        assert self.__file is not None
+        subject_grp = self.__file[self.__subjects[0]]
+        assert isinstance(subject_grp, h5py.Group)
+        eeg_data = subject_grp['eeg']
+        assert isinstance(eeg_data, h5py.Dataset)
+        return eeg_data.attrs['chOrder']
 
 
 class ShockDataset(Dataset):
@@ -89,9 +109,9 @@ class ShockDataset(Dataset):
         self.__start_percentage = start_percentage
         self.__end_percentage = end_percentage
 
-        self.__datasets = []
-        self.__length = None
-        self.__feature_size = None
+        self.__datasets: List[SingleShockDataset] = []
+        self.__length: int = 0
+        self.__feature_size: Optional[List[int]] = None
 
         self.__dataset_idxes = []
         
@@ -110,10 +130,10 @@ class ShockDataset(Dataset):
         self.__feature_size = self.__datasets[0].feature_size
 
     @property
-    def feature_size(self):
+    def feature_size(self) -> Optional[List[int]]:
         return self.__feature_size
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.__length
 
     def __getitem__(self, idx: int):

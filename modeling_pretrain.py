@@ -39,6 +39,7 @@ class TemporalConv(nn.Module):
         self.conv3 = nn.Conv2d(out_chans, out_chans, kernel_size=(1, 3), padding=(0, 1))
         self.norm3 = nn.GroupNorm(4, out_chans)
         self.gelu3 = nn.GELU()
+        self.patch_shape = (1, 1)  # Placeholder for compatibility
 
     def forward(self, x, **kwargs):
         x = rearrange(x, 'B N A T -> B (N A) T')
@@ -55,7 +56,7 @@ class NeuralTransformerForMaskedEEGModeling(nn.Module):
     def __init__(self, EEG_size=1600, patch_size=200, in_chans=1, out_chans=8, vocab_size=8192, embed_dim=200, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, qk_norm=None, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., norm_layer=None, init_values=None, attn_head_dim=None,
-                 use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False, init_std=0.02):
+                 use_abs_pos_emb=True, use_rel_pos_bias=False, use_shared_rel_pos_bias=False, init_std=0.02):  # noqa: ARG002
         super().__init__()
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
 
@@ -74,11 +75,15 @@ class NeuralTransformerForMaskedEEGModeling(nn.Module):
 
         self.rel_pos_bias = None
 
+        # Use default LayerNorm if norm_layer is not provided
+        if norm_layer is None:
+            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_norm=qk_norm, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer,  # type: ignore[arg-type]
                 init_values=init_values, window_size=self.patch_embed.patch_shape if use_rel_pos_bias else None,
                 attn_head_dim=attn_head_dim,
             )
@@ -138,10 +143,10 @@ class NeuralTransformerForMaskedEEGModeling(nn.Module):
         x = x * (1 - w) + mask_token * w
 
         x = torch.cat((cls_tokens, x), dim=1)
-        pos_embed_used = self.pos_embed[:, input_chans] if input_chans is not None else self.pos_embed
         if self.pos_embed is not None:
+            pos_embed_used = self.pos_embed[:, input_chans] if input_chans is not None else self.pos_embed
             pos_embed = pos_embed_used[:, 1:, :].unsqueeze(2).expand(batch_size, -1, time_window, -1).flatten(1, 2)
-            pos_embed = torch.cat((pos_embed[:,0:1,:].expand(batch_size, -1, -1), pos_embed), dim=1)
+            pos_embed = torch.cat((pos_embed_used[:,0:1,:].expand(batch_size, -1, -1), pos_embed), dim=1)
             x = x + pos_embed
         if self.time_embed is not None:
             time_embed = self.time_embed[:, 0:time_window, :].unsqueeze(1).expand(batch_size, c, -1, -1).flatten(1, 2)
@@ -255,6 +260,7 @@ class NeuralTransformerForMEM(nn.Module):
         return {'student.cls_token', 'student.pos_embed', 'student.time_embed'}
     
     def forward(self, x, input_chans=None, bool_masked_pos=None):
+        assert bool_masked_pos is not None, "bool_masked_pos is required"
         x_masked = self.student(x, input_chans, bool_masked_pos, return_all_patch_tokens=True)
         x_masked_no_cls = x_masked[:, 1:]
         x_rec = self.lm_head(x_masked_no_cls[bool_masked_pos])
@@ -279,7 +285,7 @@ def labram_base_patch200_1600_8k_vocab(pretrained=False, **kwargs): #5M
     model = NeuralTransformerForMEM(
         patch_size=200, embed_dim=200, depth=12, num_heads=10, mlp_ratio=4, qkv_bias=False, qk_norm=partial(nn.LayerNorm, eps=1e-6),
         norm_layer=partial(nn.LayerNorm, eps=1e-6), vocab_size=vocab_size, **kwargs)
-    model.default_cfg = _cfg()
+    model.default_cfg = _cfg()  # type: ignore[assignment]
     if pretrained:
         checkpoint = torch.load(
             kwargs["init_ckpt"], map_location="cpu"
@@ -300,7 +306,7 @@ def labram_large_patch200_1600_8k_vocab(pretrained=False, **kwargs): #50M
     model = NeuralTransformerForMEM(
         patch_size=200, embed_dim=400, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=False, qk_norm=partial(nn.LayerNorm, eps=1e-6), out_chans=16,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), vocab_size=vocab_size, **kwargs)
-    model.default_cfg = _cfg()
+    model.default_cfg = _cfg()  # type: ignore[assignment]
     if pretrained:
         checkpoint = torch.load(
             kwargs["init_ckpt"], map_location="cpu"
@@ -320,7 +326,7 @@ def labram_huge_patch200_1600_8k_vocab(pretrained=False, **kwargs): #380M
     model = NeuralTransformerForMEM(
         patch_size=200, embed_dim=800, depth=48, num_heads=16, mlp_ratio=4, qkv_bias=False, qk_norm=partial(nn.LayerNorm, eps=1e-6), out_chans=32,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), vocab_size=vocab_size, **kwargs)
-    model.default_cfg = _cfg()
+    model.default_cfg = _cfg()  # type: ignore[assignment]
     if pretrained:
         checkpoint = torch.load(
             kwargs["init_ckpt"], map_location="cpu"

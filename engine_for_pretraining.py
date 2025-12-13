@@ -8,7 +8,6 @@
 # https://github.com/facebookresearch/dino
 # ---------------------------------------------------------
 
-from cgitb import enable
 import math
 import sys
 from typing import Iterable

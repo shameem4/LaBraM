@@ -43,11 +43,12 @@ import json
 import logging
 from pathlib import Path
 import sys
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
+from numpy.typing import NDArray
 import mne
-from mne_bids import BIDSPath, read_raw_bids
+from mne_bids import BIDSPath, get_bids_path_from_fname, read_raw_bids
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -60,6 +61,8 @@ from dataset_maker.shock.utils.eegUtils import preprocessing_edf
 SUPPORTED_HELPER_EXTS = {".edf", ".bdf"}
 TABULAR_EXTENSIONS = {".tsv": "\t", ".csv": ","}
 LOGGER = logging.getLogger("labram.bids")
+
+EEGArray = NDArray[np.floating]
 
 
 def parse_args() -> argparse.Namespace:
@@ -137,9 +140,45 @@ def parse_args() -> argparse.Namespace:
         help="Walk the datasets and report estimated HDF5 sizes, but do not write output",
     )
     parser.add_argument(
+        "--list-datasets",
+        action="store_true",
+        help="List discovered BIDS dataset roots under --bids-root and exit",
+    )
+    parser.add_argument(
+        "--dataset-index",
+        type=int,
+        default=None,
+        help="Only process a single discovered dataset (0-based index from --list-datasets)",
+    )
+    parser.add_argument(
+        "--max-datasets",
+        type=int,
+        default=1,
+        help="Stop after processing this many discovered datasets (debug helper)",
+    )
+    parser.add_argument(
+        "--max-recordings",
+        type=int,
+        default=None,
+        help="Stop after processing this many recordings total (debug helper)",
+    )
+    parser.add_argument(
+        "--resample-n-jobs",
+        type=str,
+        default="1",
+        help="Value passed to mne Raw.resample n_jobs (int or 'cuda'); use 1 if unsure",
+    )
+    parser.add_argument(
+        "--mne-log-level",
+        type=str,
+        default="WARNING",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Verbosity for MNE's internal logger",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
-        default="ERROR",
+        default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
@@ -189,6 +228,34 @@ def discover_bids_roots(root: Path) -> List[Path]:
 
     LOGGER.warning("No dataset_description.json found under %s; treating it as a single BIDS dataset", root)
     return [root]
+
+
+def select_bids_roots(
+    root: Path, dataset_index: Optional[int] = None, max_datasets: Optional[int] = None
+) -> List[Path]:
+    roots = discover_bids_roots(root)
+    if dataset_index is not None:
+        if dataset_index < 0 or dataset_index >= len(roots):
+            raise IndexError(
+                f"--dataset-index {dataset_index} is out of range; discovered {len(roots)} dataset(s)"
+            )
+        roots = [roots[dataset_index]]
+    if max_datasets is not None:
+        if max_datasets < 1:
+            raise ValueError("--max-datasets must be >= 1")
+        roots = roots[:max_datasets]
+    return roots
+
+
+def iter_bids_paths_selected(
+    bids_root: Path,
+    dataset_index: Optional[int] = None,
+    max_datasets: Optional[int] = None,
+) -> Iterable[BIDSPath]:
+    for dataset_root in select_bids_roots(
+        bids_root, dataset_index=dataset_index, max_datasets=max_datasets
+    ):
+        yield from _iter_dataset_paths(dataset_root)
 
 
 def _iter_dataset_paths(dataset_root: Path) -> Iterable[BIDSPath]:
@@ -245,7 +312,7 @@ def _paths_from_scans_file(scans_path: Path, bids_root: Path) -> Iterable[BIDSPa
                     LOGGER.debug("Skipping %s because it is outside the BIDS root", data_path)
                     continue
                 try:
-                    yield BIDSPath(fpath=data_path)
+                    yield get_bids_path_from_fname(data_path, check=False)
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.debug("Could not build BIDSPath from %s: %s", data_path, exc)
     except FileNotFoundError:
@@ -267,7 +334,7 @@ def _open_text_file(path: Path):
     return path.open("r", encoding="utf-8")
 
 
-def _load_tabular_matrix(path: Path, delimiter: str) -> Tuple[np.ndarray, List[str]]:
+def _load_tabular_matrix(path: Path, delimiter: str) -> Tuple[EEGArray, List[str]]:
     with _open_text_file(path) as handle:
         header_line = handle.readline().strip()
         if not header_line:
@@ -275,7 +342,7 @@ def _load_tabular_matrix(path: Path, delimiter: str) -> Tuple[np.ndarray, List[s
         headers = [col.strip() or f"CH{idx+1}" for idx, col in enumerate(header_line.split(delimiter))]
         data = np.loadtxt(handle, delimiter=delimiter, dtype=np.float64, ndmin=2)
     data = data.T  # channels × samples
-    return data, [name.upper() for name in headers]
+    return cast(EEGArray, data), [name.upper() for name in headers]
 
 
 def _load_sampling_frequency(bids_path: BIDSPath) -> float:
@@ -288,12 +355,21 @@ def _load_sampling_frequency(bids_path: BIDSPath) -> float:
     return float(metadata["SamplingFrequency"])
 
 
-def apply_standard_preprocessing(raw, l_freq: float, h_freq: float, notch_freq: float, resample: int):
-    raw.load_data()
-    raw.filter(l_freq=l_freq, h_freq=h_freq)
-    raw.notch_filter(notch_freq)
-    raw.resample(resample, n_jobs="auto")
-    return raw.get_data(units="uV"), raw.ch_names
+def apply_standard_preprocessing(
+    raw,
+    l_freq: float,
+    h_freq: float,
+    notch_freq: float,
+    resample: int,
+    resample_n_jobs,
+    mne_verbose: str,
+) -> Tuple[EEGArray, List[str]]:
+    raw.load_data(verbose=mne_verbose)
+    raw.filter(l_freq=l_freq, h_freq=h_freq, verbose=mne_verbose)
+    raw.notch_filter(notch_freq, verbose=mne_verbose)
+    raw.resample(resample, n_jobs=resample_n_jobs, verbose=mne_verbose)
+    data = cast(EEGArray, raw.get_data(units="uV"))
+    return data, list(raw.ch_names)
 
 
 def preprocess_recording(
@@ -302,42 +378,53 @@ def preprocess_recording(
     h_freq: float,
     notch_freq: float,
     resample: int,
+    resample_n_jobs,
+    mne_verbose: str,
     drop_channels: Optional[Sequence[str]],
     standard_channels: Optional[Sequence[str]],
-):
+) -> Tuple[Optional[EEGArray], List[str]]:
     ext = _canonical_extension(bids_path.fpath)
     if ext == ".edf":
-        return preprocessing_edf(
+        data, ch_names = preprocessing_edf(
             bids_path.fpath,
             l_freq=l_freq,
             h_freq=h_freq,
             sfreq=resample,
-            drop_channels=list(drop_channels) if drop_channels else None,
-            standard_channels=list(standard_channels) if standard_channels else None,
+            drop_channels=list(drop_channels) if drop_channels else [],
+            standard_channels=list(standard_channels) if standard_channels else [],
         )
+        if data is None:
+            return None, []
+        return cast(EEGArray, data), [str(name) for name in ch_names]
 
     if ext == ".bdf":
-        return preprocess_bdf_recording(
+        data, ch_names = preprocess_bdf_recording(
             bids_path,
             l_freq=l_freq,
             h_freq=h_freq,
             notch_freq=notch_freq,
             resample=resample,
+            resample_n_jobs=resample_n_jobs,
+            mne_verbose=mne_verbose,
             drop_channels=drop_channels,
             standard_channels=standard_channels,
         )
+        return data, ch_names
 
     if ext in TABULAR_EXTENSIONS:
-        return preprocess_tabular_recording(
+        data, ch_names = preprocess_tabular_recording(
             bids_path,
             delimiter=TABULAR_EXTENSIONS[ext],
             l_freq=l_freq,
             h_freq=h_freq,
             notch_freq=notch_freq,
             resample=resample,
+            resample_n_jobs=resample_n_jobs,
+            mne_verbose=mne_verbose,
             drop_channels=drop_channels,
             standard_channels=standard_channels,
         )
+        return data, ch_names
 
     raw = read_raw_bids(bids_path, verbose="ERROR")
     if drop_channels:
@@ -348,7 +435,15 @@ def preprocess_recording(
             raw.reorder_channels(list(standard_channels))
         except ValueError:
             LOGGER.warning("Channel reorder failed for %s; keeping native order", bids_path.basename)
-    data, ch_names = apply_standard_preprocessing(raw, l_freq, h_freq, notch_freq, resample)
+    data, ch_names = apply_standard_preprocessing(
+        raw,
+        l_freq,
+        h_freq,
+        notch_freq,
+        resample,
+        resample_n_jobs=resample_n_jobs,
+        mne_verbose=mne_verbose,
+    )
     return data, ch_names
 
 
@@ -359,9 +454,11 @@ def preprocess_tabular_recording(
     h_freq: float,
     notch_freq: float,
     resample: int,
+    resample_n_jobs,
+    mne_verbose: str,
     drop_channels: Optional[Sequence[str]],
     standard_channels: Optional[Sequence[str]],
-):
+) -> Tuple[EEGArray, List[str]]:
     data_matrix, ch_names = _load_tabular_matrix(bids_path.fpath, delimiter)
     sfreq = _load_sampling_frequency(bids_path)
     info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="eeg")
@@ -377,7 +474,15 @@ def preprocess_tabular_recording(
         except ValueError:
             LOGGER.warning("Channel reorder failed for %s; keeping native order", bids_path.basename)
 
-    data, ch_names = apply_standard_preprocessing(raw, l_freq, h_freq, notch_freq, resample)
+    data, ch_names = apply_standard_preprocessing(
+        raw,
+        l_freq,
+        h_freq,
+        notch_freq,
+        resample,
+        resample_n_jobs=resample_n_jobs,
+        mne_verbose=mne_verbose,
+    )
     return data, ch_names
 
 
@@ -387,9 +492,11 @@ def preprocess_bdf_recording(
     h_freq: float,
     notch_freq: float,
     resample: int,
+    resample_n_jobs,
+    mne_verbose: str,
     drop_channels: Optional[Sequence[str]],
     standard_channels: Optional[Sequence[str]],
-):
+) -> Tuple[EEGArray, List[str]]:
     raw = mne.io.read_raw_bdf(bids_path.fpath, preload=True, verbose="ERROR")
     if drop_channels:
         drop = [ch for ch in drop_channels if ch in raw.ch_names]
@@ -400,13 +507,40 @@ def preprocess_bdf_recording(
             raw.reorder_channels(list(standard_channels))
         except ValueError:
             LOGGER.warning("Channel reorder failed for %s; keeping native order", bids_path.basename)
-    data, ch_names = apply_standard_preprocessing(raw, l_freq, h_freq, notch_freq, resample)
+    data, ch_names = apply_standard_preprocessing(
+        raw,
+        l_freq,
+        h_freq,
+        notch_freq,
+        resample,
+        resample_n_jobs=resample_n_jobs,
+        mne_verbose=mne_verbose,
+    )
     return data, ch_names
 
 
 def main():
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level))
+    mne.set_log_level(args.mne_log_level)
+
+    resample_n_jobs_raw = (args.resample_n_jobs or "").strip()
+    if resample_n_jobs_raw.lower() == "cuda":
+        resample_n_jobs = "cuda"
+    else:
+        try:
+            resample_n_jobs = int(resample_n_jobs_raw)
+        except ValueError as exc:
+            raise ValueError("--resample-n-jobs must be an int or 'cuda'") from exc
+
+    if args.list_datasets:
+        roots = discover_bids_roots(args.bids_root)
+        if not roots:
+            print(f"No BIDS datasets discovered under {args.bids_root.resolve()}")
+            return
+        for idx, root in enumerate(roots):
+            print(f"[{idx}] {root}")
+        return
 
     output_file = args.output_dir / f"{args.dataset_name}.hdf5"
     if not args.dry_run:
@@ -420,7 +554,12 @@ def main():
     processed = 0
     chunks = None
     total_bytes = 0
-    for bids_path in iter_bids_paths(args.bids_root):
+    for bids_path in iter_bids_paths_selected(
+        args.bids_root, dataset_index=args.dataset_index, max_datasets=args.max_datasets
+    ):
+        if args.max_recordings is not None and processed >= args.max_recordings:
+            LOGGER.info("Reached --max-recordings=%d, stopping early", args.max_recordings)
+            break
         LOGGER.info("Processing %s", bids_path.basename)
         if not bids_path.fpath.exists():
             LOGGER.warning("Skipping %s because file is missing (%s)", bids_path.basename, bids_path.fpath)
@@ -432,6 +571,8 @@ def main():
                 h_freq=args.h_freq,
                 notch_freq=args.notch,
                 resample=args.resample,
+                resample_n_jobs=resample_n_jobs,
+                mne_verbose=args.mne_log_level,
                 drop_channels=args.drop_channels,
                 standard_channels=channel_template,
             )

@@ -18,7 +18,7 @@ import glob
 from collections import defaultdict, deque
 import datetime
 import numpy as np
-from timm.utils import get_state_dict
+from timm.utils.model import get_state_dict
 
 from pathlib import Path
 import argparse
@@ -32,7 +32,7 @@ from tensorboardX import SummaryWriter
 from data_processor.dataset import ShockDataset
 import pickle
 from scipy.signal import resample
-from pyhealth.metrics import binary_metrics_fn, multiclass_metrics_fn
+from pyhealth.metrics import binary_metrics_fn, multiclass_metrics_fn  # type: ignore[import-not-found]
 import pandas as pd
 from sklearn.metrics import r2_score
 from sklearn.metrics import mean_squared_error
@@ -486,10 +486,11 @@ def load_state_dict(model, state_dict, prefix='', ignore_missing="relative_posit
 def get_grad_norm(parameters, norm_type=2):
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
-    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    parameters = [p for p in parameters if p.grad is not None]
     norm_type = float(norm_type)
-    total_norm = 0
+    total_norm = 0.0
     for p in parameters:
+        assert p.grad is not None
         param_norm = p.grad.data.norm(norm_type)
         total_norm += param_norm.item() ** norm_type
     total_norm = total_norm ** (1. / norm_type)
@@ -527,19 +528,21 @@ class NativeScalerWithGradNormCount:
 def get_grad_norm_(parameters, norm_type: float = 2.0, layer_names=None) -> torch.Tensor:
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
-    
+
     parameters = [p for p in parameters if p.grad is not None]
-        
+
     norm_type = float(norm_type)
     if len(parameters) == 0:
         return torch.tensor(0.)
-    device = parameters[0].grad.device
-    
+    first_grad = parameters[0].grad
+    assert first_grad is not None
+    device = first_grad.device
+
     if norm_type == inf:
-        total_norm = max(p.grad.detach().abs().max().to(device) for p in parameters)
+        total_norm = max(p.grad.detach().abs().max().to(device) for p in parameters if p.grad is not None)  # type: ignore[type-var]
     else:
         # total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), norm_type)
-        layer_norm = torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters])
+        layer_norm = torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters if p.grad is not None])
         total_norm = torch.norm(layer_norm, norm_type)
         # print(layer_norm.max(dim=0))
         
@@ -644,7 +647,7 @@ def auto_load_model(args, model, model_without_ddp, optimizer, loss_scaler, mode
                 if 'scaler' in checkpoint:
                     loss_scaler.load_state_dict(checkpoint['scaler'])
                 print("With optim & sched!")
-            if 'optimizer_disc' in checkpoint:
+            if 'optimizer_disc' in checkpoint and optimizer_disc is not None:
                 optimizer_disc.load_state_dict(checkpoint['optimizer_disc'])
     else:
         # deepspeed, only support '--auto_resume'.
