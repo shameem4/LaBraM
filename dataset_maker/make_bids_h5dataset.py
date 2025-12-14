@@ -693,7 +693,8 @@ def main():
                         eeg_data = eeg_data[:, :-trim]
 
                 ch_order = [name.upper() for name in ch_names]
-                chunks = chunks or (len(ch_order), args.resample)
+                chunk_samples = min(args.resample, eeg_data.shape[1])
+                dataset_chunks = (len(ch_order), chunk_samples) if chunk_samples > 0 else (len(ch_order), 1)
 
                 group_name = bids_path.basename.replace(".eeg", "")
                 bytes_estimate = eeg_data.size * 4  # float32 storage
@@ -711,7 +712,7 @@ def main():
                     continue
 
                 grp = dataset.addGroup(group_name)
-                dset = dataset.addDataset(grp, "eeg", eeg_data.astype(np.float32), chunks)
+                dset = dataset.addDataset(grp, "eeg", eeg_data.astype(np.float32), dataset_chunks)
                 dataset.addAttributes(dset, "lFreq", args.l_freq)
                 dataset.addAttributes(dset, "hFreq", args.h_freq)
                 dataset.addAttributes(dset, "rsFreq", args.resample)
