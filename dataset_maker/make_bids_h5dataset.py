@@ -5,10 +5,11 @@ This script walks one or more BIDS-compliant EEG datasets (default location:
 shipping LaBraM scripts, and stores the results in the HDF5 layout consumed by
 `data_processor.dataset` and `utils.build_pretraining_dataset`. It inspects the
 subject/session `scans.tsv` metadata to automatically resolve the underlying EEG
-file extension, allowing ingestion of binary formats such as EDF/BDF and
-tabular exports (`*.tsv`, `*.csv`, and their `.gz` variants). When the supplied
-`--bids-root` contains multiple datasets (for example, several OpenNeuro downloads
-in sibling folders), the script will traverse each dataset automatically.
+file extension, allowing ingestion of binary formats such as EDF/BDF, BrainVision
+(.vhdr/.eeg/.vmrk), and tabular exports (`*.tsv`, `*.csv`, and their `.gz` variants).
+When the supplied `--bids-root` contains multiple datasets (for example, several
+OpenNeuro downloads in sibling folders), the script will traverse each dataset
+automatically.
 
 Usage example (Windows PowerShell):
 
@@ -59,8 +60,11 @@ if str(REPO_ROOT) not in sys.path:
 from dataset_maker.shock.utils.h5 import h5Dataset
 from dataset_maker.shock.utils.eegUtils import preprocessing_edf
 
-SUPPORTED_HELPER_EXTS = {".edf", ".bdf"}
+SUPPORTED_HELPER_EXTS = {".edf", ".bdf", ".vhdr"}
 TABULAR_EXTENSIONS = {".tsv": "\t", ".csv": ","}
+BRAINVISION_EXTENSIONS = {".vhdr", ".eeg", ".vmrk"}
+# Companion files that should not be processed directly (e.g., .fdt accompanies .set)
+SKIP_EXTENSIONS = {".fdt", ".vmrk", ".eeg"}
 LOGGER = logging.getLogger("labram.bids")
 
 EEGArray = NDArray[np.floating]
@@ -354,6 +358,10 @@ def _paths_from_scans_file(scans_path: Path, bids_root: Path) -> Iterable[BIDSPa
                 rel_path = (row.get(filename_key) or "").strip()
                 if not rel_path or "_eeg" not in rel_path:
                     continue
+                # Skip companion files that shouldn't be processed directly
+                ext = Path(rel_path).suffix.lower()
+                if ext in SKIP_EXTENSIONS:
+                    continue
                 data_path = (base_dir / rel_path).resolve()
                 try:
                     data_path.relative_to(bids_root.resolve())
@@ -425,7 +433,7 @@ def apply_standard_preprocessing(
 def _extract_event_matrix(raw) -> Optional[NDArray[np.int64]]:
     """Capture stim-based events before resampling so resolution stays accurate."""
     stim_picks = mne.pick_types(raw.info, stim=True)
-    if not stim_picks:
+    if stim_picks.size == 0:
         return None
     stim_channel = raw.ch_names[stim_picks[0]]
     try:
@@ -487,6 +495,20 @@ def preprocess_recording(
         )
         return data, ch_names
 
+    if ext == ".vhdr":
+        data, ch_names = preprocess_brainvision_recording(
+            bids_path,
+            l_freq=l_freq,
+            h_freq=h_freq,
+            notch_freq=notch_freq,
+            resample=resample,
+            resample_n_jobs=resample_n_jobs,
+            mne_verbose=mne_verbose,
+            drop_channels=drop_channels,
+            standard_channels=standard_channels,
+        )
+        return data, ch_names
+
     if ext in TABULAR_EXTENSIONS:
         data, ch_names = preprocess_tabular_recording(
             bids_path,
@@ -505,7 +527,7 @@ def preprocess_recording(
     raw = read_raw_bids(bids_path, verbose="ERROR")
     if drop_channels:
         usable = [ch for ch in raw.ch_names if ch not in drop_channels]
-        raw.pick_channels(usable, ordered=True)
+        raw.pick(usable)
     if standard_channels and len(standard_channels) == len(raw.ch_names):
         try:
             raw.reorder_channels(list(standard_channels))
@@ -574,6 +596,40 @@ def preprocess_bdf_recording(
     standard_channels: Optional[Sequence[str]],
 ) -> Tuple[EEGArray, List[str]]:
     raw = mne.io.read_raw_bdf(bids_path.fpath, preload=True, verbose="ERROR")
+    if drop_channels:
+        drop = [ch for ch in drop_channels if ch in raw.ch_names]
+        if drop:
+            raw.drop_channels(drop)
+    if standard_channels and len(standard_channels) == len(raw.ch_names):
+        try:
+            raw.reorder_channels(list(standard_channels))
+        except ValueError:
+            LOGGER.warning("Channel reorder failed for %s; keeping native order", bids_path.basename)
+    data, ch_names = apply_standard_preprocessing(
+        raw,
+        l_freq,
+        h_freq,
+        notch_freq,
+        resample,
+        resample_n_jobs=resample_n_jobs,
+        mne_verbose=mne_verbose,
+    )
+    return data, ch_names
+
+
+def preprocess_brainvision_recording(
+    bids_path: BIDSPath,
+    l_freq: float,
+    h_freq: float,
+    notch_freq: float,
+    resample: int,
+    resample_n_jobs,
+    mne_verbose: str,
+    drop_channels: Optional[Sequence[str]],
+    standard_channels: Optional[Sequence[str]],
+) -> Tuple[EEGArray, List[str]]:
+    """Preprocess BrainVision format files (.vhdr/.eeg/.vmrk triplet)."""
+    raw = mne.io.read_raw_brainvision(bids_path.fpath, preload=True, verbose="ERROR")
     if drop_channels:
         drop = [ch for ch in drop_channels if ch in raw.ch_names]
         if drop:
@@ -696,7 +752,10 @@ def main():
                 chunk_samples = min(args.resample, eeg_data.shape[1])
                 dataset_chunks = (len(ch_order), chunk_samples) if chunk_samples > 0 else (len(ch_order), 1)
 
-                group_name = bids_path.basename.replace(".eeg", "")
+                # Strip common EEG extensions from group name
+                group_name = bids_path.basename
+                for ext_to_strip in (".eeg", ".vhdr", ".edf", ".bdf"):
+                    group_name = group_name.replace(ext_to_strip, "")
                 bytes_estimate = eeg_data.size * 4  # float32 storage
                 total_bytes += bytes_estimate
                 LOGGER.info(
