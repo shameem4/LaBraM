@@ -38,19 +38,18 @@ duplicating preprocessing logic.
 from __future__ import annotations
 
 import argparse
-import csv
-import gzip
 import json
 import logging
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 import sys
-from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple, TypedDict, Union, cast
+import warnings
+from typing import Iterable, List, Literal, Optional, Sequence, Tuple, TypedDict, Union, cast
 
 import numpy as np
 from numpy.typing import NDArray
 import mne
-from mne_bids import BIDSPath, get_bids_path_from_fname, read_raw_bids
+from mne_bids import BIDSPath, read_raw_bids
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -58,11 +57,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from dataset_maker.shock.utils.h5 import h5Dataset
-from dataset_maker.shock.utils.eegUtils import preprocessing_edf
 
-SUPPORTED_HELPER_EXTS = {".edf", ".bdf", ".vhdr"}
-TABULAR_EXTENSIONS = {".tsv": "\t", ".csv": ","}
-BRAINVISION_EXTENSIONS = {".vhdr", ".eeg", ".vmrk"}
 # Companion files that should not be processed directly (e.g., .fdt accompanies .set)
 SKIP_EXTENSIONS = {".fdt", ".vmrk", ".eeg"}
 LOGGER = logging.getLogger("labram.bids")
@@ -253,11 +248,6 @@ def load_channel_template(path: Optional[Path]) -> Optional[List[str]]:
     return [line.strip().upper() for line in text.splitlines() if line.strip()]
 
 
-def iter_bids_paths(bids_root: Path) -> Iterable[BIDSPath]:
-    for dataset_root in discover_bids_roots(bids_root):
-        yield from _iter_dataset_paths(dataset_root)
-
-
 def discover_bids_roots(root: Path) -> List[Path]:
     root = root.resolve()
     descriptor = root / "dataset_description.json"
@@ -312,107 +302,41 @@ def iter_bids_paths_selected(
 
 
 def _iter_dataset_paths(dataset_root: Path) -> Iterable[BIDSPath]:
-    discovered_any = False
-    for meta_path in _iter_metadata_bids_paths(dataset_root):
-        discovered_any = True
-        yield meta_path
-
-    if discovered_any:
-        return
-
+    """Discover EEG files in a BIDS dataset using mne-bids pattern matching."""
     template = BIDSPath(root=dataset_root, datatype="eeg", suffix="eeg")
     matches = template.match()
     if not matches:
         LOGGER.warning("No EEG files found under %s", dataset_root)
-        return []
+        return
     for match in matches:
+        # Skip companion files (.fdt, .vmrk, .eeg)
+        if match.fpath.suffix.lower() in SKIP_EXTENSIONS:
+            continue
         yield match
 
 
-def _iter_metadata_bids_paths(bids_root: Path) -> Iterable[BIDSPath]:
-    seen = set()
-    for scans_file in bids_root.rglob("scans.tsv"):
-        if any(part == "derivatives" for part in scans_file.parts):
-            continue
-        for bids_path in _paths_from_scans_file(scans_file, bids_root):
-            if bids_path.fpath in seen:
-                continue
-            seen.add(bids_path.fpath)
-            yield bids_path
+def _apply_channel_selection(
+    raw,
+    drop_channels: Optional[Sequence[str]],
+    standard_channels: Optional[Sequence[str]],
+    source_name: str,
+) -> None:
+    """Apply channel dropping and reordering to a Raw object in-place."""
+    if drop_channels:
+        drop = [ch for ch in drop_channels if ch in raw.ch_names]
+        if drop:
+            raw.drop_channels(drop)
+    if standard_channels and len(standard_channels) == len(raw.ch_names):
+        try:
+            raw.reorder_channels(list(standard_channels))
+        except ValueError:
+            LOGGER.warning("Channel reorder failed for %s; keeping native order", source_name)
 
 
-def _paths_from_scans_file(scans_path: Path, bids_root: Path) -> Iterable[BIDSPath]:
-    if not scans_path.exists():
-        return []
-
-    base_dir = scans_path.parent
-    try:
-        with scans_path.open("r", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle, delimiter="\t")
-            if not reader.fieldnames:
-                return []
-            filename_key = next((name for name in reader.fieldnames if name and name.lower() == "filename"), None)
-            if filename_key is None:
-                return []
-            for row in reader:
-                rel_path = (row.get(filename_key) or "").strip()
-                if not rel_path or "_eeg" not in rel_path:
-                    continue
-                # Skip companion files that shouldn't be processed directly
-                ext = Path(rel_path).suffix.lower()
-                if ext in SKIP_EXTENSIONS:
-                    continue
-                data_path = (base_dir / rel_path).resolve()
-                try:
-                    data_path.relative_to(bids_root.resolve())
-                except ValueError:
-                    LOGGER.debug("Skipping %s because it is outside the BIDS root", data_path)
-                    continue
-                try:
-                    yield get_bids_path_from_fname(data_path, check=False)
-                except Exception as exc:  # noqa: BLE001
-                    LOGGER.debug("Could not build BIDSPath from %s: %s", data_path, exc)
-    except FileNotFoundError:
-        return []
+MIN_DURATION_SECONDS = 10  # Skip recordings shorter than this
 
 
-def _canonical_extension(path: Path) -> str:
-    suffixes = [s.lower() for s in path.suffixes]
-    if not suffixes:
-        return ""
-    if suffixes[-1] == ".gz" and len(suffixes) >= 2:
-        return suffixes[-2]
-    return suffixes[-1]
-
-
-def _open_text_file(path: Path):
-    if path.suffix.lower() == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("r", encoding="utf-8")
-
-
-def _load_tabular_matrix(path: Path, delimiter: str) -> Tuple[EEGArray, List[str]]:
-    with _open_text_file(path) as handle:
-        header_line = handle.readline().strip()
-        if not header_line:
-            raise ValueError(f"Missing header row in {path}")
-        headers = [col.strip() or f"CH{idx+1}" for idx, col in enumerate(header_line.split(delimiter))]
-        data = np.loadtxt(handle, delimiter=delimiter, dtype=np.float64, ndmin=2)
-    data = data.T  # channels × samples
-    return cast(EEGArray, data), [name.upper() for name in headers]
-
-
-def _load_sampling_frequency(bids_path: BIDSPath) -> float:
-    sidecar = bids_path.copy().update(suffix="eeg", extension=".json", check=False)
-    if not sidecar.fpath.exists():
-        raise FileNotFoundError(f"Sidecar JSON not found for {bids_path.basename}")
-    metadata = json.loads(sidecar.fpath.read_text(encoding="utf-8"))
-    if "SamplingFrequency" not in metadata:
-        raise KeyError(f"SamplingFrequency missing in {sidecar.fpath}")
-    return float(metadata["SamplingFrequency"])
-
-
-def apply_standard_preprocessing(
+def _preprocess_raw(
     raw,
     l_freq: float,
     h_freq: float,
@@ -420,8 +344,25 @@ def apply_standard_preprocessing(
     resample: int,
     resample_n_jobs,
     mne_verbose: str,
+    drop_channels: Optional[Sequence[str]],
+    standard_channels: Optional[Sequence[str]],
+    source_name: str,
 ) -> Tuple[EEGArray, List[str]]:
-    raw.load_data(verbose=mne_verbose)
+    """Apply channel selection and standard preprocessing to a Raw object."""
+    # Pick only EEG channels (recordings may contain GSR, misc, temperature, etc.)
+    raw.pick(picks="eeg", verbose=mne_verbose)
+    _apply_channel_selection(raw, drop_channels, standard_channels, source_name)
+
+    # Skip recordings that are too short for filtering
+    duration = raw.n_times / raw.info["sfreq"]
+    if duration < MIN_DURATION_SECONDS:
+        LOGGER.warning("Skipping %s: too short (%.1fs < %ds minimum)",
+                      source_name, duration, MIN_DURATION_SECONDS)
+        return np.array([]), []
+
+    # Data should already be preloaded, but ensure it's in memory for filtering
+    if not raw.preload:
+        raw.load_data(verbose=mne_verbose)
     raw.filter(l_freq=l_freq, h_freq=h_freq, verbose=mne_verbose)
     raw.notch_filter(notch_freq, verbose=mne_verbose)
     events = _extract_event_matrix(raw)
@@ -437,7 +378,9 @@ def _extract_event_matrix(raw) -> Optional[NDArray[np.int64]]:
         return None
     stim_channel = raw.ch_names[stim_picks[0]]
     try:
-        events = mne.find_events(raw, stim_channel=stim_channel, verbose="ERROR")
+        events = mne.find_events(
+            raw, stim_channel=stim_channel, initial_event=True, verbose="ERROR"
+        )
     except (ValueError, RuntimeError) as exc:  # pragma: no cover - best effort
         LOGGER.debug("Could not extract events from %s: %s", stim_channel, exc)
         return None
@@ -448,9 +391,16 @@ def _extract_event_matrix(raw) -> Optional[NDArray[np.int64]]:
 
 def _preprocess_task(payload: Tuple[BIDSPath, PreprocessConfig]) -> PreprocessResult:
     """Worker wrapper so multiprocessing can call preprocess_recording safely."""
+    # Suppress noisy warnings in worker processes
+    warnings.filterwarnings("ignore", message="Loky-backed parallel loops cannot be called")
+    warnings.filterwarnings("ignore", message="Input line .* contained no data")
     bids_path, config = payload
     try:
         data, ch_names = preprocess_recording(bids_path, **config)
+    except OSError as exc:
+        # Log more details for OS-level errors (path issues, file access, etc.)
+        LOGGER.error("OS error processing %s (path: %s): %s", bids_path.basename, bids_path.fpath, exc)
+        return {"status": "error", "bids_path": bids_path, "exception": exc}
     except Exception as exc:  # pragma: no cover - best effort
         return {"status": "error", "bids_path": bids_path, "exception": exc}
     return {"status": "ok", "bids_path": bids_path, "data": data, "ch_names": ch_names}
@@ -467,188 +417,29 @@ def preprocess_recording(
     drop_channels: Optional[Sequence[str]],
     standard_channels: Optional[Sequence[str]],
 ) -> Tuple[Optional[EEGArray], List[str]]:
-    ext = _canonical_extension(bids_path.fpath)
-    if ext == ".edf":
-        data, ch_names = preprocessing_edf(
-            bids_path.fpath,
-            l_freq=l_freq,
-            h_freq=h_freq,
-            sfreq=resample,
-            drop_channels=list(drop_channels) if drop_channels else [],
-            standard_channels=list(standard_channels) if standard_channels else [],
-        )
-        if data is None:
-            return None, []
-        return cast(EEGArray, data), [str(name) for name in ch_names]
-
-    if ext == ".bdf":
-        data, ch_names = preprocess_bdf_recording(
-            bids_path,
-            l_freq=l_freq,
-            h_freq=h_freq,
-            notch_freq=notch_freq,
-            resample=resample,
-            resample_n_jobs=resample_n_jobs,
-            mne_verbose=mne_verbose,
-            drop_channels=drop_channels,
-            standard_channels=standard_channels,
-        )
-        return data, ch_names
-
-    if ext == ".vhdr":
-        data, ch_names = preprocess_brainvision_recording(
-            bids_path,
-            l_freq=l_freq,
-            h_freq=h_freq,
-            notch_freq=notch_freq,
-            resample=resample,
-            resample_n_jobs=resample_n_jobs,
-            mne_verbose=mne_verbose,
-            drop_channels=drop_channels,
-            standard_channels=standard_channels,
-        )
-        return data, ch_names
-
-    if ext in TABULAR_EXTENSIONS:
-        data, ch_names = preprocess_tabular_recording(
-            bids_path,
-            delimiter=TABULAR_EXTENSIONS[ext],
-            l_freq=l_freq,
-            h_freq=h_freq,
-            notch_freq=notch_freq,
-            resample=resample,
-            resample_n_jobs=resample_n_jobs,
-            mne_verbose=mne_verbose,
-            drop_channels=drop_channels,
-            standard_channels=standard_channels,
-        )
-        return data, ch_names
-
-    raw = read_raw_bids(bids_path, verbose="ERROR")
-    if drop_channels:
-        usable = [ch for ch in raw.ch_names if ch not in drop_channels]
-        raw.pick(usable)
-    if standard_channels and len(standard_channels) == len(raw.ch_names):
-        try:
-            raw.reorder_channels(list(standard_channels))
-        except ValueError:
-            LOGGER.warning("Channel reorder failed for %s; keeping native order", bids_path.basename)
-    data, ch_names = apply_standard_preprocessing(
-        raw,
-        l_freq,
-        h_freq,
-        notch_freq,
-        resample,
-        resample_n_jobs=resample_n_jobs,
-        mne_verbose=mne_verbose,
+    """Load and preprocess a BIDS EEG recording using mne-bids."""
+    # Try mne-bids first, fall back to direct MNE reader for problematic files
+    try:
+        raw = read_raw_bids(bids_path, verbose="ERROR", extra_params={"preload": True})
+    except OSError:
+        # Windows memory-mapping issues with large files - try direct MNE reader
+        ext = bids_path.fpath.suffix.lower()
+        fpath = str(bids_path.fpath)
+        if ext == ".vhdr":
+            raw = mne.io.read_raw_brainvision(fpath, preload=True, verbose="ERROR")
+        elif ext == ".edf":
+            raw = mne.io.read_raw_edf(fpath, preload=True, verbose="ERROR")
+        elif ext == ".bdf":
+            raw = mne.io.read_raw_bdf(fpath, preload=True, verbose="ERROR")
+        elif ext == ".set":
+            raw = mne.io.read_raw_eeglab(fpath, preload=True, verbose="ERROR")
+        else:
+            raise  # Re-raise for unsupported formats
+        LOGGER.debug("Loaded %s using direct MNE reader (bypassed mne-bids)", bids_path.basename)
+    return _preprocess_raw(
+        raw, l_freq, h_freq, notch_freq, resample, resample_n_jobs,
+        mne_verbose, drop_channels, standard_channels, bids_path.basename
     )
-    return data, ch_names
-
-
-def preprocess_tabular_recording(
-    bids_path: BIDSPath,
-    delimiter: str,
-    l_freq: float,
-    h_freq: float,
-    notch_freq: float,
-    resample: int,
-    resample_n_jobs,
-    mne_verbose: str,
-    drop_channels: Optional[Sequence[str]],
-    standard_channels: Optional[Sequence[str]],
-) -> Tuple[EEGArray, List[str]]:
-    data_matrix, ch_names = _load_tabular_matrix(bids_path.fpath, delimiter)
-    sfreq = _load_sampling_frequency(bids_path)
-    info = mne.create_info(ch_names=ch_names, sfreq=sfreq, ch_types="eeg")
-    raw = mne.io.RawArray(data_matrix, info, verbose="ERROR")
-
-    if drop_channels:
-        drop = [ch for ch in drop_channels if ch in raw.ch_names]
-        if drop:
-            raw.drop_channels(drop)
-    if standard_channels and len(standard_channels) == len(raw.ch_names):
-        try:
-            raw.reorder_channels(list(standard_channels))
-        except ValueError:
-            LOGGER.warning("Channel reorder failed for %s; keeping native order", bids_path.basename)
-
-    data, ch_names = apply_standard_preprocessing(
-        raw,
-        l_freq,
-        h_freq,
-        notch_freq,
-        resample,
-        resample_n_jobs=resample_n_jobs,
-        mne_verbose=mne_verbose,
-    )
-    return data, ch_names
-
-
-def preprocess_bdf_recording(
-    bids_path: BIDSPath,
-    l_freq: float,
-    h_freq: float,
-    notch_freq: float,
-    resample: int,
-    resample_n_jobs,
-    mne_verbose: str,
-    drop_channels: Optional[Sequence[str]],
-    standard_channels: Optional[Sequence[str]],
-) -> Tuple[EEGArray, List[str]]:
-    raw = mne.io.read_raw_bdf(bids_path.fpath, preload=True, verbose="ERROR")
-    if drop_channels:
-        drop = [ch for ch in drop_channels if ch in raw.ch_names]
-        if drop:
-            raw.drop_channels(drop)
-    if standard_channels and len(standard_channels) == len(raw.ch_names):
-        try:
-            raw.reorder_channels(list(standard_channels))
-        except ValueError:
-            LOGGER.warning("Channel reorder failed for %s; keeping native order", bids_path.basename)
-    data, ch_names = apply_standard_preprocessing(
-        raw,
-        l_freq,
-        h_freq,
-        notch_freq,
-        resample,
-        resample_n_jobs=resample_n_jobs,
-        mne_verbose=mne_verbose,
-    )
-    return data, ch_names
-
-
-def preprocess_brainvision_recording(
-    bids_path: BIDSPath,
-    l_freq: float,
-    h_freq: float,
-    notch_freq: float,
-    resample: int,
-    resample_n_jobs,
-    mne_verbose: str,
-    drop_channels: Optional[Sequence[str]],
-    standard_channels: Optional[Sequence[str]],
-) -> Tuple[EEGArray, List[str]]:
-    """Preprocess BrainVision format files (.vhdr/.eeg/.vmrk triplet)."""
-    raw = mne.io.read_raw_brainvision(bids_path.fpath, preload=True, verbose="ERROR")
-    if drop_channels:
-        drop = [ch for ch in drop_channels if ch in raw.ch_names]
-        if drop:
-            raw.drop_channels(drop)
-    if standard_channels and len(standard_channels) == len(raw.ch_names):
-        try:
-            raw.reorder_channels(list(standard_channels))
-        except ValueError:
-            LOGGER.warning("Channel reorder failed for %s; keeping native order", bids_path.basename)
-    data, ch_names = apply_standard_preprocessing(
-        raw,
-        l_freq,
-        h_freq,
-        notch_freq,
-        resample,
-        resample_n_jobs=resample_n_jobs,
-        mne_verbose=mne_verbose,
-    )
-    return data, ch_names
 
 
 def main():
@@ -690,8 +481,8 @@ def main():
     dataset = None if args.dry_run else h5Dataset(output_dir, args.dataset_name)
 
     processed = 0
-    chunks = None
     total_bytes = 0
+    seen_groups: set[str] = set()
 
     preprocess_config: PreprocessConfig = {
         "l_freq": args.l_freq,
@@ -754,8 +545,15 @@ def main():
 
                 # Strip common EEG extensions from group name
                 group_name = bids_path.basename
-                for ext_to_strip in (".eeg", ".vhdr", ".edf", ".bdf"):
+                for ext_to_strip in (".eeg", ".vhdr", ".edf", ".bdf", ".set"):
                     group_name = group_name.replace(ext_to_strip, "")
+                # Handle duplicate group names (same basename from different paths)
+                if group_name in seen_groups:
+                    # Make unique by appending subject/session info from path
+                    unique_suffix = f"_{bids_path.subject}_{bids_path.session}" if bids_path.session else f"_{bids_path.subject}"
+                    group_name = f"{group_name}{unique_suffix}"
+                    LOGGER.debug("Duplicate group name detected, using: %s", group_name)
+                seen_groups.add(group_name)
                 bytes_estimate = eeg_data.size * 4  # float32 storage
                 total_bytes += bytes_estimate
                 LOGGER.info(
