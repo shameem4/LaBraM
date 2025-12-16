@@ -138,34 +138,40 @@ def find_nearest_electrode(
 ) -> Tuple[str, float]:
     """Find the electrode nearest to target coordinates."""
     min_dist = float('inf')
-    nearest = None
+    nearest: str | None = None
 
     for name, coord in electrodes.items():
         # Skip neck electrodes if requested
         if exclude_neck and name.startswith('N'):
             continue
 
-        dist = np.linalg.norm(target_coord - coord)
+        dist = float(np.linalg.norm(target_coord - coord))
         if dist < min_dist:
-            min_dist = dist
+            min_dist = float(dist)
             nearest = name
 
-    return nearest, min_dist
+    if nearest is None:
+        raise ValueError("No electrodes available to search (after exclusions)")
+
+    return nearest, float(min_dist)
 
 
 def find_nearest_1020(eq_coord: np.ndarray) -> Tuple[str, float]:
     """Find the 10-20 position nearest to an equidistant electrode coordinate."""
     min_dist = float('inf')
-    nearest = None
+    nearest: str | None = None
 
     for std_name, std_coord in STANDARD_1020_COORDS.items():
         std_coord = np.array(std_coord)
-        dist = np.linalg.norm(eq_coord - std_coord)
+        dist = float(np.linalg.norm(eq_coord - std_coord))
         if dist < min_dist:
-            min_dist = dist
+            min_dist = float(dist)
             nearest = std_name
 
-    return nearest, min_dist
+    if nearest is None:
+        raise ValueError("STANDARD_1020_COORDS is empty")
+
+    return nearest, float(min_dist)
 
 
 def create_mapping(
