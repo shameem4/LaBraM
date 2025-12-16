@@ -52,6 +52,122 @@ STANDARD_1020 = [
     "FP1-F3", "F3-C3", "C3-P3", "P3-O1", "FP2-F4", "F4-C4", "C4-P4", "P4-O2"
 ]
 
+# Channel alias mapping for non-standard electrode systems
+# Maps non-standard names -> closest standard 10-20 position
+# See CHANNEL_MAPPING.md for anatomical rationale
+CHANNEL_ALIASES: dict[str, str] = {
+    # =========================================================================
+    # cEEGrid: Around-the-ear electrode array (L=left, R=right, 1-8 = anterior to posterior)
+    # Reference: Debener et al. "Unobtrusive ambulatory EEG using a smartphone"
+    # Electrodes curve around the ear from preauricular (front) to mastoid (back)
+    # =========================================================================
+    'L1': 'FT9',   # Left anterior (in front of ear, level with tragus) -> fronto-temporal
+    'L2': 'T9',    # Left upper anterior -> inferior temporal
+    'L3': 'T7',    # Left at ear level -> temporal (T7/T3)
+    'L4': 'TP9',   # Left upper posterior -> temporo-parietal
+    'L4A': 'TP9',  # Left upper posterior variant A
+    'L4B': 'TP9',  # Left upper posterior variant B
+    'L5': 'TP9',   # Left mid posterior -> temporo-parietal
+    'L6': 'M1',    # Left lower posterior -> left mastoid
+    'L7': 'M1',    # Left mastoid area -> left mastoid
+    'L8': 'M1',    # Left inferior mastoid -> left mastoid
+    'R1': 'FT10',  # Right anterior -> fronto-temporal
+    'R2': 'T10',   # Right upper anterior -> inferior temporal
+    'R3': 'T8',    # Right at ear level -> temporal (T8/T4)
+    'R4': 'TP10',  # Right upper posterior -> temporo-parietal
+    'R4A': 'TP10', # Right upper posterior variant A
+    'R4B': 'TP10', # Right upper posterior variant B
+    'R5': 'TP10',  # Right mid posterior -> temporo-parietal
+    'R6': 'M2',    # Right lower posterior -> right mastoid
+    'R7': 'M2',    # Right mastoid area -> right mastoid
+    'R8': 'M2',    # Right inferior mastoid -> right mastoid
+
+    # =========================================================================
+    # earEEG / In-ear EEG: Electrodes placed in or around the ear canal
+    # These are all near the external auditory meatus, closest to T9/T10 and mastoids
+    # =========================================================================
+    'LB': 'T9',    # Left Bottom (lower ear canal) -> inferior temporal
+    'LT': 'T9',    # Left Top (upper ear canal) -> inferior temporal
+    'RB': 'T10',   # Right Bottom -> inferior temporal
+    'RT': 'T10',   # Right Top -> inferior temporal
+    'ELE': 'T9',   # Generic ear electrode -> default to left inferior temporal
+    'LE': 'T9',    # Left Ear generic
+    'RE': 'T10',   # Right Ear generic
+    'LEA': 'T9',   # Left Ear A
+    'LEB': 'T9',   # Left Ear B
+    'REA': 'T10',  # Right Ear A
+    'REB': 'T10',  # Right Ear B
+
+    # =========================================================================
+    # IDUN Guardian earbuds: In-ear EEG with 3 electrodes per ear
+    # =========================================================================
+    'L_A': 'T9',   # Left electrode A
+    'L_B': 'T9',   # Left electrode B
+    'L_C': 'T9',   # Left electrode C
+    'R_A': 'T10',  # Right electrode A
+    'R_B': 'T10',  # Right electrode B
+    'R_C': 'T10',  # Right electrode C
+
+    # =========================================================================
+    # Muse headband: Forehead + behind-ear electrodes
+    # =========================================================================
+    'TP9_MUSE': 'TP9',   # Left behind ear
+    'AF7_MUSE': 'AF7',   # Left forehead
+    'AF8_MUSE': 'AF8',   # Right forehead
+    'TP10_MUSE': 'TP10', # Right behind ear
+
+    # =========================================================================
+    # Emotiv EPOC/EPOC+: 14-channel headset with non-standard naming
+    # =========================================================================
+    'AF3_EMOTIV': 'AF3',
+    'F7_EMOTIV': 'F7',
+    'F3_EMOTIV': 'F3',
+    'FC5_EMOTIV': 'FC5',
+    'T7_EMOTIV': 'T7',
+    'P7_EMOTIV': 'P7',
+    'O1_EMOTIV': 'O1',
+    'O2_EMOTIV': 'O2',
+    'P8_EMOTIV': 'P8',
+    'T8_EMOTIV': 'T8',
+    'FC6_EMOTIV': 'FC6',
+    'F4_EMOTIV': 'F4',
+    'F8_EMOTIV': 'F8',
+    'AF4_EMOTIV': 'AF4',
+
+    # =========================================================================
+    # Alternative temporal electrode names (older 10-20 naming)
+    # =========================================================================
+    'T3': 'T7',    # Old name for T7 (left temporal)
+    'T4': 'T8',    # Old name for T8 (right temporal)
+    'T5': 'P7',    # Old name for P7 (left posterior temporal)
+    'T6': 'P8',    # Old name for P8 (right posterior temporal)
+
+    # =========================================================================
+    # Common reference electrode aliases
+    # =========================================================================
+    'MASTL': 'M1',  # Left mastoid
+    'MASTR': 'M2',  # Right mastoid
+    'LMAS': 'M1',
+    'RMAS': 'M2',
+    'LM': 'M1',
+    'RM': 'M2',
+    'EARR': 'A2',   # Right ear reference
+    'EARL': 'A1',   # Left ear reference
+
+    # =========================================================================
+    # OpenBCI Cyton default channel names (when not configured)
+    # Maps to common clinical montage positions
+    # =========================================================================
+    'EXG1': 'FP1',
+    'EXG2': 'FP2',
+    'EXG3': 'C3',
+    'EXG4': 'C4',
+    'EXG5': 'P7',
+    'EXG6': 'P8',
+    'EXG7': 'O1',
+    'EXG8': 'O2',
+}
+
 LOGGER = logging.getLogger("labram.inference")
 
 
@@ -137,6 +253,11 @@ def parse_args() -> argparse.Namespace:
 def get_input_chans(ch_names: List[str]) -> tuple[List[int], List[int], List[str]]:
     """Map channel names to standard 10-20 positions for LaBraM.
 
+    Handles:
+    - Standard 10-20 names (FP1, CZ, O2, etc.)
+    - Reference notation (C4:A1 -> C4, O2-A1 -> O2)
+    - Non-standard systems via CHANNEL_ALIASES (cEEGrid, earEEG, etc.)
+
     Returns:
         input_chans: Position embedding indices (starts with 0 for CLS token)
         valid_eeg_indices: Indices into the original EEG array for valid channels
@@ -150,13 +271,26 @@ def get_input_chans(ch_names: List[str]) -> tuple[List[int], List[int], List[str
         ch_upper = ch_name.upper()
         # Strip reference notation (e.g., "C4:A1" -> "C4", "O2-A1" -> "O2")
         ch_base = ch_upper.split(':')[0].split('-')[0].strip()
-        try:
+
+        # Try direct match first
+        if ch_base in STANDARD_1020:
             idx = STANDARD_1020.index(ch_base) + 1
             input_chans.append(idx)
             valid_eeg_indices.append(i)
             valid_ch_names.append(ch_name)
-        except ValueError:
-            LOGGER.debug(f"Channel '{ch_name}' (base: '{ch_base}') not in standard 10-20 montage, skipping")
+            continue
+
+        # Try alias mapping for non-standard electrode systems
+        if ch_base in CHANNEL_ALIASES:
+            mapped_name = CHANNEL_ALIASES[ch_base]
+            idx = STANDARD_1020.index(mapped_name) + 1
+            input_chans.append(idx)
+            valid_eeg_indices.append(i)
+            valid_ch_names.append(ch_name)
+            LOGGER.debug(f"Channel '{ch_name}' mapped via alias: {ch_base} -> {mapped_name}")
+            continue
+
+        LOGGER.debug(f"Channel '{ch_name}' (base: '{ch_base}') not in standard 10-20 or aliases, skipping")
 
     return input_chans, valid_eeg_indices, valid_ch_names
 
