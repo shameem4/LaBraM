@@ -42,6 +42,7 @@ import json
 import logging
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
+import re
 import sys
 import warnings
 from typing import Iterable, List, Literal, Optional, Sequence, Tuple, TypedDict, Union, cast
@@ -61,6 +62,25 @@ from dataset_maker.shock.utils.h5 import h5Dataset
 # Companion files that should not be processed directly (e.g., .fdt accompanies .set)
 SKIP_EXTENSIONS = {".fdt", ".vmrk", ".eeg"}
 LOGGER = logging.getLogger("labram.bids")
+
+
+_DATASET_ID_RE = re.compile(r"(ds\d{6})(?:-download)?", re.IGNORECASE)
+
+
+def infer_dataset_id(bids_path: BIDSPath) -> Optional[str]:
+    """Infer OpenNeuro-style dataset id (e.g., ds004460) from a BIDSPath."""
+    try:
+        root_str = str(bids_path.root)
+    except Exception:
+        root_str = ""
+    for candidate in (root_str, getattr(bids_path, "fpath", "")):
+        text = str(candidate)
+        if not text:
+            continue
+        m = _DATASET_ID_RE.search(text)
+        if m:
+            return m.group(1).lower()
+    return None
 
 EEGArray = NDArray[np.floating]
 
@@ -570,6 +590,12 @@ def main():
 
                 grp = dataset.addGroup(group_name)
                 dset = dataset.addDataset(grp, "eeg", eeg_data.astype(np.float32), dataset_chunks)
+
+                dataset_id = infer_dataset_id(bids_path)
+                if dataset_id:
+                    dataset.addAttributes(grp, "dataset_id", dataset_id)
+                    dataset.addAttributes(dset, "dataset_id", dataset_id)
+
                 dataset.addAttributes(dset, "lFreq", args.l_freq)
                 dataset.addAttributes(dset, "hFreq", args.h_freq)
                 dataset.addAttributes(dset, "rsFreq", args.resample)

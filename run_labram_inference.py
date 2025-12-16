@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+import re
 import sys
 from typing import List, Optional
 
@@ -42,6 +43,52 @@ from channel_maps import (
 )
 
 LOGGER = logging.getLogger("labram.inference")
+
+
+_DATASET_ID_RE = re.compile(r"(ds\d{6})(?:-download)?", re.IGNORECASE)
+
+
+def _as_str(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="ignore")
+    return str(value)
+
+
+def infer_dataset_id_from_h5(
+    rec_group: h5py.Group,
+    eeg_dset: h5py.Dataset,
+    input_path: Path,
+) -> Optional[str]:
+    """Infer dataset id (e.g., ds004460) for a given recording.
+
+    Primary signal is the `source_bids_path` attribute written by
+    `dataset_maker/make_bids_h5dataset.py`. Falls back to other metadata.
+    """
+    candidates: list[str] = []
+
+    # Prefer explicit dataset id if present.
+    if "dataset_id" in eeg_dset.attrs:
+        candidates.append(_as_str(eeg_dset.attrs.get("dataset_id")))
+    if "dataset_id" in rec_group.attrs:
+        candidates.append(_as_str(rec_group.attrs.get("dataset_id")))
+
+    if "source_bids_path" in eeg_dset.attrs:
+        candidates.append(_as_str(eeg_dset.attrs.get("source_bids_path")))
+    if "source_bids_path" in rec_group.attrs:
+        candidates.append(_as_str(rec_group.attrs.get("source_bids_path")))
+
+    # Last resort: input filename may include the dataset id.
+    candidates.append(_as_str(input_path))
+
+    for raw in candidates:
+        if not raw:
+            continue
+        m = _DATASET_ID_RE.search(raw)
+        if m:
+            return m.group(1).lower()
+    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -127,7 +174,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=f"Channel map(s) to use for electrode name mapping. "
              f"Available: {list_channel_maps()}. Multiple maps can be specified "
-             f"(later maps override earlier). Default: all common maps except ds004460.",
+             f"(later maps override earlier). If omitted, the script will try to infer "
+             f"the dataset id (e.g., ds004460) from each recording's source metadata "
+             f"and apply that dataset's map automatically; otherwise it falls back to "
+             f"the common default maps.",
     )
     parser.add_argument(
         "--list-channel-maps",
@@ -170,22 +220,29 @@ def get_input_chans(
         # Strip reference notation (e.g., "C4:A1" -> "C4", "O2-A1" -> "O2")
         ch_base = ch_upper.split(':')[0].split('-')[0].strip()
 
+        # If an explicit alias is provided for this channel name, prefer it.
+        # This allows dataset-specific maps to override ambiguous labels that
+        # may also appear in STANDARD_1020 (e.g., BioSemi "A1" is not mastoid A1).
+        if ch_base in channel_aliases:
+            mapped_name = channel_aliases[ch_base]
+            if mapped_name in STANDARD_1020:
+                idx = STANDARD_1020.index(mapped_name) + 1
+                input_chans.append(idx)
+                valid_eeg_indices.append(i)
+                valid_ch_names.append(ch_name)
+                LOGGER.debug(f"Channel '{ch_name}' mapped via alias: {ch_base} -> {mapped_name}")
+                continue
+            LOGGER.debug(
+                f"Channel '{ch_name}' alias target '{mapped_name}' is not in standard 10-20 list, skipping"
+            )
+            continue
+
         # Try direct match first
         if ch_base in STANDARD_1020:
             idx = STANDARD_1020.index(ch_base) + 1
             input_chans.append(idx)
             valid_eeg_indices.append(i)
             valid_ch_names.append(ch_name)
-            continue
-
-        # Try alias mapping for non-standard electrode systems
-        if ch_base in channel_aliases:
-            mapped_name = channel_aliases[ch_base]
-            idx = STANDARD_1020.index(mapped_name) + 1
-            input_chans.append(idx)
-            valid_eeg_indices.append(i)
-            valid_ch_names.append(ch_name)
-            LOGGER.debug(f"Channel '{ch_name}' mapped via alias: {ch_base} -> {mapped_name}")
             continue
 
         LOGGER.debug(f"Channel '{ch_name}' (base: '{ch_base}') not in standard 10-20 or aliases, skipping")
@@ -353,9 +410,18 @@ def main():
         print("Example: --channel-map ceegrid eareeg  (for cEEGrid + earEEG)")
         return
 
-    # Build channel alias map from --channel-map argument
-    channel_aliases = get_channel_map(args.channel_map)
-    LOGGER.info(f"Using channel maps: {args.channel_map or 'default'} ({len(channel_aliases)} aliases)")
+    # If --channel-map is provided, we use it globally.
+    # Otherwise we infer dataset per-recording and select the map at runtime.
+    explicit_channel_aliases: Optional[dict[str, str]] = None
+    if args.channel_map is not None:
+        explicit_channel_aliases = get_channel_map(args.channel_map)
+        LOGGER.info(
+            f"Using explicit channel maps: {args.channel_map} ({len(explicit_channel_aliases)} aliases)"
+        )
+    else:
+        LOGGER.info("Auto-selecting channel map per recording based on dataset id")
+
+    channel_alias_cache: dict[str, dict[str, str]] = {}
 
     # Validate paths
     if not args.input.exists():
@@ -430,10 +496,31 @@ def main():
                     LOGGER.warning(f"No channel order for {rec_name}, using default indices")
                     ch_order = [f"CH{i}" for i in range(eeg_data.shape[0])]
 
+                # Pick the right channel map.
+                if explicit_channel_aliases is not None:
+                    channel_aliases = explicit_channel_aliases
+                else:
+                    dataset_id = infer_dataset_id_from_h5(grp, eeg_dset, args.input)
+                    cache_key = dataset_id or "__default__"
+                    if cache_key not in channel_alias_cache:
+                        if dataset_id is None:
+                            channel_alias_cache[cache_key] = get_channel_map()
+                            LOGGER.info(
+                                "No dataset id found for %s; using common default channel maps",
+                                rec_name,
+                            )
+                        else:
+                            channel_alias_cache[cache_key] = get_channel_map([dataset_id], include_default=True)
+                            LOGGER.info(
+                                "Detected dataset %s for %s; using channel map '%s'",
+                                dataset_id,
+                                rec_name,
+                                dataset_id,
+                            )
+                    channel_aliases = channel_alias_cache[cache_key]
+
                 # Get input channel mapping and filter to valid channels
-                input_chans, valid_eeg_indices, valid_ch_names = get_input_chans(
-                    ch_order, channel_aliases
-                )
+                input_chans, valid_eeg_indices, valid_ch_names = get_input_chans(ch_order, channel_aliases)
 
                 # Check if we have enough valid channels
                 if len(input_chans) < 2:  # Only CLS token

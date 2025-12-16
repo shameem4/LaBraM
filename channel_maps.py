@@ -16,6 +16,60 @@ Usage:
 
 from typing import Dict, List, Optional
 
+
+def _build_tuh_eeg_prefix_map() -> Dict[str, str]:
+    """Build mapping for TUH-style channel names.
+
+    TUH EDFs commonly use labels like "EEG FP1-REF". The inference pipeline
+    strips reference suffixes and hyphenated parts, so these become "EEG FP1".
+    This map converts those to standard 10-20 labels.
+    """
+
+    # Common TUH referential labels (post-stripping they look like "EEG <CH>").
+    base = {
+        # Core 10-20
+        "EEG FP1": "FP1",
+        "EEG FP2": "FP2",
+        "EEG F3": "F3",
+        "EEG F4": "F4",
+        "EEG C3": "C3",
+        "EEG C4": "C4",
+        "EEG P3": "P3",
+        "EEG P4": "P4",
+        "EEG O1": "O1",
+        "EEG O2": "O2",
+        "EEG F7": "F7",
+        "EEG F8": "F8",
+
+        # Midline
+        "EEG FZ": "FZ",
+        "EEG CZ": "CZ",
+        "EEG PZ": "PZ",
+
+        # References / auxiliaries often present in TUH
+        "EEG A1": "A1",
+        "EEG A2": "A2",
+        "EEG T1": "T1",
+        "EEG T2": "T2",
+
+        # Legacy temporal names seen in TUH: map to modern 10-20
+        "EEG T3": "T7",
+        "EEG T4": "T8",
+        "EEG T5": "P7",
+        "EEG T6": "P8",
+    }
+
+    # Also accept variants that show up after upstream normalization.
+    # (Keeping this conservative; add more as needed.)
+    base.update(
+        {
+            "EEG FPZ": "FPZ",
+            "EEG OZ": "OZ",
+        }
+    )
+
+    return base
+
 # =============================================================================
 # Standard 10-20 electrode positions (used for position embeddings in LaBraM)
 # These positions correspond to the position embedding indices in the model.
@@ -65,6 +119,25 @@ CHANNEL_MAPS: Dict[str, Dict[str, str]] = {
         'EARR': 'A2',
         'EARL': 'A1',
     },
+
+    # =========================================================================
+    # TUH EEG datasets (e.g., TUAB, TUEV)
+    # Channels commonly appear as "EEG FP1-REF" etc.
+    # =========================================================================
+    "tuab": _build_tuh_eeg_prefix_map(),
+    "tuev": _build_tuh_eeg_prefix_map(),
+
+    # =========================================================================
+    # Shock dataset (CNT/EDF via shock utils)
+    # Usually already uses standard channel names after preprocessing.
+    # =========================================================================
+    "shock": {},
+
+    # =========================================================================
+    # Generic BIDS conversions
+    # MNE-BIDS typically yields standard names; keep map for explicit opt-in.
+    # =========================================================================
+    "bids": {},
 
     # =========================================================================
     # cEEGrid: Around-the-ear electrode array
@@ -346,6 +419,325 @@ CHANNEL_MAPS: Dict[str, Dict[str, str]] = {
 }
 
 
+# =============================================================================
+# Dataset aliases / per-dataset entries
+#
+# These keys are convenience aliases so users can select a map by dataset
+# identifier (e.g., OpenNeuro accession). Some datasets already use standard
+# 10-20 names and therefore do not require any additional alias mapping.
+# =============================================================================
+
+# Datasets observed under D:/neuro_datasets (BIDS roots).
+# - If mapping isn't needed, keep an empty dict (still allowing explicit opt-in).
+# - If a dataset uses a known non-standard naming scheme, alias it to a device map.
+
+CHANNEL_MAPS.setdefault("ds003969", {})   # Standard 10-20 names (case-insensitive)
+CHANNEL_MAPS.setdefault("ds004279", {})   # Standard 10-20 names
+
+# ds004408 appears to use non-10-20 channel names (e.g., A1..A19). No built-in map.
+CHANNEL_MAPS.setdefault("ds004408", {})
+
+# ds004460 is already defined above (equidistant cap). Add a common folder-name alias.
+CHANNEL_MAPS.setdefault("ds004460-download", CHANNEL_MAPS["ds004460"])
+
+# Ear-EEG sleep monitoring dataset uses LB/LT/RB/RT.
+CHANNEL_MAPS.setdefault("ds005178", CHANNEL_MAPS["eareeg"])
+
+# Surrey cEEGrid sleep dataset uses L1..L8 / R1..R8.
+CHANNEL_MAPS.setdefault("ds005207", CHANNEL_MAPS["ceegrid"])
+
+# HBN EEG appears to use E1..En channel names (likely EGI/NetStation). No built-in map.
+CHANNEL_MAPS.setdefault("ds005514", {})
+
+# BOAS headband dataset uses HB_1/HB_2.
+CHANNEL_MAPS.setdefault("ds005555", CHANNEL_MAPS["headband"])
+
+CHANNEL_MAPS.setdefault("ds006104", {})   # Standard 10-20 names (mixed case)
+
+# =============================================================================
+# High-density cap systems
+#
+# Some BIDS datasets use manufacturer channel labels (e.g., BioSemi A1..D32,
+# EGI E1..E128). These overlap with a few standard labels (notably A1/A2), so
+# they should be selected explicitly (or via dataset aliases below).
+#
+# These maps were generated as a best-effort nearest-neighbor assignment from
+# the vendor montage to standard_1005, restricted to LaBraM's STANDARD_1020.
+# =============================================================================
+
+CHANNEL_MAPS.setdefault(
+    "biosemi128",
+    {
+        'A1': 'CZ',
+        'A10': 'P7',
+        'A11': 'P7',
+        'A12': 'P9',
+        'A13': 'PO9',
+        'A14': 'PO9',
+        'A15': 'O1',
+        'A16': 'PO5',
+        'A17': 'PO3',
+        'A18': 'P3',
+        'A19': 'PZ',
+        'A2': 'CZ',
+        'A20': 'POZ',
+        'A21': 'POZ',
+        'A22': 'OZ',
+        'A23': 'OZ',
+        'A24': 'IZ',
+        'A25': 'IZ',
+        'A26': 'PO10',
+        'A27': 'PO10',
+        'A28': 'O2',
+        'A29': 'PO6',
+        'A3': 'CPZ',
+        'A30': 'PO4',
+        'A31': 'P4',
+        'A32': 'P2',
+        'A4': 'CPZ',
+        'A5': 'P1',
+        'A6': 'CP3',
+        'A7': 'CP3',
+        'A8': 'P5',
+        'A9': 'P5',
+        'B1': 'CZ',
+        'B10': 'TPP10H',
+        'B11': 'TP8',
+        'B12': 'TPP8H',
+        'B13': 'CP6',
+        'B14': 'T8',
+        'B15': 'CCP6',
+        'B16': 'CCP6',
+        'B17': 'CCP4',
+        'B18': 'CCP4',
+        'B19': 'CCP2',
+        'B2': 'CCP2',
+        'B20': 'C2',
+        'B21': 'C2',
+        'B22': 'C4',
+        'B23': 'C4',
+        'B24': 'C6',
+        'B25': 'C6',
+        'B26': 'T8',
+        'B27': 'FT8',
+        'B28': 'FC6',
+        'B29': 'FC6',
+        'B3': 'CP4',
+        'B30': 'FC4',
+        'B31': 'FC4',
+        'B32': 'FC2',
+        'B4': 'CP4',
+        'B5': 'P6',
+        'B6': 'P6',
+        'B7': 'P8',
+        'B8': 'P8',
+        'B9': 'P10',
+        'C1': 'FCZ',
+        'C10': 'F4',
+        'C11': 'FC2',
+        'C12': 'F2',
+        'C13': 'F2',
+        'C14': 'AF2',
+        'C15': 'AF4',
+        'C16': 'FP2',
+        'C17': 'FPZ',
+        'C18': 'FPZ',
+        'C19': 'AFZ',
+        'C2': 'FC2',
+        'C20': 'AFZ',
+        'C21': 'FZ',
+        'C22': 'FZ',
+        'C23': 'FCZ',
+        'C24': 'FC1',
+        'C25': 'F1',
+        'C26': 'F1',
+        'C27': 'AF1',
+        'C28': 'AF3',
+        'C29': 'FP1',
+        'C3': 'F2',
+        'C30': 'AF7',
+        'C31': 'AF5',
+        'C32': 'F3',
+        'C4': 'F4',
+        'C5': 'F6',
+        'C6': 'F6',
+        'C7': 'F8',
+        'C8': 'AF8',
+        'C9': 'AF6',
+        'D1': 'FCZ',
+        'D10': 'FC5',
+        'D11': 'FC3',
+        'D12': 'FC3',
+        'D13': 'FC1',
+        'D14': 'C1',
+        'D15': 'CZ',
+        'D16': 'CCP1',
+        'D17': 'CCP1',
+        'D18': 'C3',
+        'D19': 'C3',
+        'D2': 'FC1',
+        'D20': 'C3',
+        'D21': 'C5',
+        'D22': 'C5',
+        'D23': 'T7',
+        'D24': 'TTP7H',
+        'D25': 'TTP7H',
+        'D26': 'CCP5',
+        'D27': 'CCP3',
+        'D28': 'CCP3',
+        'D29': 'CP5',
+        'D3': 'F1',
+        'D30': 'CP5',
+        'D31': 'TP7',
+        'D32': 'TPP9H',
+        'D4': 'F3',
+        'D5': 'F5',
+        'D6': 'F5',
+        'D7': 'F7',
+        'D8': 'FT7',
+        'D9': 'FC5',
+    },
+)
+
+CHANNEL_MAPS.setdefault(
+    "hydrocel128",
+    {
+        'E1': 'AF8',
+        'E2': 'AF6',
+        'E3': 'AF4',
+        'E4': 'F2',
+        'E5': 'FZ',
+        'E6': 'FCZ',
+        'E7': 'FCZ',
+        'E8': 'FP2',
+        'E9': 'FP2',
+        'E10': 'AF2',
+        'E11': 'AFZ',
+        'E12': 'FZ',
+        'E13': 'FC1',
+        'E14': 'FPZ',
+        'E15': 'FPZ',
+        'E16': 'AFZ',
+        'E17': 'FPZ',
+        'E18': 'AF1',
+        'E19': 'F1',
+        'E20': 'F1',
+        'E21': 'FPZ',
+        'E22': 'AF3',
+        'E23': 'AF3',
+        'E24': 'F3',
+        'E25': 'FP1',
+        'E26': 'AF5',
+        'E27': 'F3',
+        'E28': 'F3',
+        'E29': 'FC3',
+        'E30': 'FC1',
+        'E31': 'C1',
+        'E32': 'AF7',
+        'E33': 'F7',
+        'E34': 'FC5',
+        'E35': 'FC3',
+        'E36': 'C3',
+        'E37': 'C1',
+        'E38': 'F9',
+        'E39': 'FT7',
+        'E40': 'C5',
+        'E41': 'C3',
+        'E42': 'CCP3',
+        'E43': 'F9',
+        'E44': 'FT9',
+        'E45': 'T7',
+        'E46': 'CCP5',
+        'E47': 'CCP5',
+        'E48': 'F9',
+        'E49': 'FT9',
+        'E50': 'TP7',
+        'E51': 'CP5',
+        'E52': 'CP3',
+        'E53': 'CP1',
+        'E54': 'CCP1',
+        'E55': 'CZ',
+        'E56': 'A1',
+        'E57': 'TP9',
+        'E58': 'P7',
+        'E59': 'P5',
+        'E60': 'P3',
+        'E61': 'P1',
+        'E62': 'PZ',
+        'E63': 'M1',
+        'E64': 'P9',
+        'E65': 'PO7',
+        'E66': 'PO3',
+        'E67': 'P1',
+        'E68': 'P9',
+        'E69': 'PO9',
+        'E70': 'O1',
+        'E71': 'PO1',
+        'E72': 'POZ',
+        'E73': 'PO9',
+        'E74': 'IZ',
+        'E75': 'OZ',
+        'E76': 'PO2',
+        'E77': 'P2',
+        'E78': 'P2',
+        'E79': 'CCP2',
+        'E80': 'C2',
+        'E81': 'IZ',
+        'E82': 'IZ',
+        'E83': 'O2',
+        'E84': 'PO4',
+        'E85': 'P4',
+        'E86': 'CP2',
+        'E87': 'C2',
+        'E88': 'PO10',
+        'E89': 'PO10',
+        'E90': 'PO8',
+        'E91': 'P6',
+        'E92': 'CP4',
+        'E93': 'CCP4',
+        'E94': 'P10',
+        'E95': 'P10',
+        'E96': 'P8',
+        'E97': 'CP6',
+        'E98': 'CCP6',
+        'E99': 'M2',
+        'E100': 'TP10',
+        'E101': 'TP8',
+        'E102': 'CCP6',
+        'E103': 'C4',
+        'E104': 'C4',
+        'E105': 'FC2',
+        'E106': 'FCZ',
+        'E107': 'A2',
+        'E108': 'T8',
+        'E109': 'C6',
+        'E110': 'FC4',
+        'E111': 'FC4',
+        'E112': 'FC2',
+        'E113': 'FT10',
+        'E114': 'FT10',
+        'E115': 'FT8',
+        'E116': 'FC6',
+        'E117': 'F4',
+        'E118': 'F2',
+        'E119': 'F10',
+        'E120': 'F10',
+        'E121': 'F10',
+        'E122': 'F8',
+        'E123': 'F4',
+        'E124': 'F4',
+        'E125': 'F10',
+        'E126': 'AF10',
+        'E127': 'AF9',
+        'E128': 'F9',
+    },
+)
+
+# Wire dataset ids to the appropriate high-density montage maps.
+CHANNEL_MAPS["ds004408"] = CHANNEL_MAPS["biosemi128"]
+CHANNEL_MAPS["ds005514"] = CHANNEL_MAPS["hydrocel128"]
+
+
 def list_channel_maps() -> List[str]:
     """Return list of available channel map names."""
     return list(CHANNEL_MAPS.keys())
@@ -374,8 +766,21 @@ def get_channel_map(
     """
     if map_names is None:
         # Default: common consumer devices (no conflicting R* channels)
-        map_names = ["ceegrid", "eareeg", "idun", "muse", "emotiv",
-                     "openbci", "psg", "headband", "dreem"]
+        map_names = [
+            "ceegrid",
+            "eareeg",
+            "idun",
+            "muse",
+            "emotiv",
+            "openbci",
+            "psg",
+            "headband",
+            "dreem",
+            # TUH datasets: safe to include by default because keys are prefixed
+            # with "EEG " and won't collide with other maps.
+            "tuab",
+            "tuev",
+        ]
 
     result: Dict[str, str] = {}
 

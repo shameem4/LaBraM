@@ -7,10 +7,12 @@ This document describes how `run_labram_inference.py` maps non-standard electrod
 LaBraM uses position embeddings based on the extended 10-20 system. When processing EEG data from non-standard devices (ear EEG, consumer headsets, etc.), we map electrode positions to their **anatomically closest** standard 10-20 equivalent.
 
 **Important caveats:**
+
 - These mappings are approximations based on anatomical proximity
 - Signal characteristics may differ due to different tissue paths and reference schemes
 - Results from ear-based electrodes should be interpreted with caution
 - Multiple non-standard electrodes may map to the same 10-20 position
+
 
 ## Channel Map System
 
@@ -54,9 +56,13 @@ python run_labram_inference.py --input data.hdf5 --channel-map ceegrid eareeg
 
 The channel matching follows this priority:
 
-1. **Direct match**: Standard 10-20 names (FP1, CZ, O2, etc.)
-2. **Reference stripping**: Remove reference notation (`C4:A1` → `C4`, `O2-A1` → `O2`)
-3. **Alias lookup**: Map via selected channel maps
+1. **Reference stripping**: Remove reference notation (`C4:A1` → `C4`, `O2-A1` → `O2`)
+2. **Alias lookup (preferred)**: If the selected channel maps define an explicit alias for this label, use it (this allows dataset/device maps to override ambiguous labels)
+3. **Direct match**: Otherwise, accept standard 10-20 names (FP1, CZ, O2, etc.)
+
+If you run [run_labram_inference.py](run_labram_inference.py) without `--channel-map`, it will automatically apply the matching dataset map per recording.
+
+The preferred signal is an explicit `dataset_id` attribute stored in the HDF5 by [dataset_maker/make_bids_h5dataset.py](dataset_maker/make_bids_h5dataset.py). If it is missing, the script falls back to inferring the dataset id from `source_bids_path`.
 
 ---
 
@@ -66,7 +72,7 @@ The cEEGrid is a flex-PCB electrode array that wraps around the ear from anterio
 
 **Reference**: Debener et al., "Unobtrusive ambulatory EEG using a smartphone and flexible printed electrodes around the ear" (2015)
 
-```
+```text
 Anatomical layout (left ear, viewed from side):
 
         L3 (T7)
@@ -341,8 +347,10 @@ This is expected for systems like earEEG where all electrodes are near the same 
 ### Poor results with ear EEG
 
 Ear-based electrodes capture different neural signals than scalp electrodes due to:
+
 - Different tissue/bone conduction paths
 - Greater distance from cortical sources
 - Different reference configurations
+
 
 Consider these mappings as "best effort" approximations rather than true equivalents.
