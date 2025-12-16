@@ -44,7 +44,7 @@ from student_model_design import (
 LOGGER = logging.getLogger("distillation")
 
 
-class LazyH5DistillationDataset(Dataset):
+class LazyH5DistillationDataset(Dataset[Dict[str, Any]]):
     """Memory-efficient dataset that lazily loads from HDF5.
 
     Indexes all valid windows at init time but loads data on-demand.
@@ -71,12 +71,19 @@ class LazyH5DistillationDataset(Dataset):
 
         with h5py.File(h5_path, 'r') as f:
             for rec_name in tqdm(list(f.keys()), desc="Indexing recordings"):
-                grp = f[rec_name]
+                item = f[rec_name]
+                if not isinstance(item, h5py.Group):
+                    continue
+                grp: h5py.Group = item
 
                 if 'embeddings' not in grp or 'inputs' not in grp:
                     continue
 
-                num_windows = grp['embeddings'].shape[0]
+                emb_dset = grp['embeddings']
+                if not isinstance(emb_dset, h5py.Dataset):
+                    continue
+
+                num_windows: int = emb_dset.shape[0]
                 input_chans = list(grp.attrs.get('input_chans', [0]))
 
                 # Store metadata
@@ -88,7 +95,7 @@ class LazyH5DistillationDataset(Dataset):
 
                 if filter_nan:
                     # Check which windows have valid embeddings
-                    embeddings = grp['embeddings'][:]
+                    embeddings: np.ndarray = emb_dset[:]
                     valid_mask = ~np.isnan(embeddings).any(axis=1)
                     valid_indices = np.where(valid_mask)[0]
 
@@ -106,25 +113,31 @@ class LazyH5DistillationDataset(Dataset):
             self.index = self.index[:max_samples]
             LOGGER.info(f"Limited to {max_samples} samples")
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.index)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
         rec_name, window_idx = self.index[idx]
         meta = self.recording_meta[rec_name]
 
         with h5py.File(self.h5_path, 'r') as f:
-            grp = f[rec_name]
+            item = f[rec_name]
+            assert isinstance(item, h5py.Group)
+            grp: h5py.Group = item
 
             # Load input window [N, A, T]
-            inputs = grp['inputs'][window_idx].astype(np.float32)
+            inputs_dset = grp['inputs']
+            assert isinstance(inputs_dset, h5py.Dataset)
+            inputs: np.ndarray = inputs_dset[window_idx].astype(np.float32)
             if self.normalize_inputs:
                 inputs = inputs / 100.0
 
             # Load teacher embedding [D]
-            embedding = grp['embeddings'][window_idx].astype(np.float32)
+            emb_dset = grp['embeddings']
+            assert isinstance(emb_dset, h5py.Dataset)
+            embedding: np.ndarray = emb_dset[window_idx].astype(np.float32)
 
-            result = {
+            result: Dict[str, Any] = {
                 'inputs': torch.from_numpy(inputs),
                 'embedding': torch.from_numpy(embedding),
                 'input_chans': torch.tensor(meta['input_chans'], dtype=torch.long),
@@ -133,7 +146,9 @@ class LazyH5DistillationDataset(Dataset):
 
             # Load token embeddings if requested and available
             if self.load_tokens and meta['has_tokens']:
-                tokens = grp['token_embeddings'][window_idx].astype(np.float32)
+                tok_dset = grp['token_embeddings']
+                assert isinstance(tok_dset, h5py.Dataset)
+                tokens: np.ndarray = tok_dset[window_idx].astype(np.float32)
                 result['tokens'] = torch.from_numpy(tokens)
 
             return result
@@ -340,29 +355,29 @@ def validate(
     cos_sim = F.cosine_similarity(all_student, all_teacher, dim=1).mean().item()
 
     # Per-dimension correlation (average Pearson r across embedding dims)
-    correlations = []
+    correlations: list[float] = []
     for d in range(all_student.shape[1]):
         s = all_student[:, d]
         t = all_teacher[:, d]
         r = torch.corrcoef(torch.stack([s, t]))[0, 1].item()
         if not np.isnan(r):
-            correlations.append(r)
-    avg_corr = np.mean(correlations) if correlations else 0.0
+            correlations.append(float(r))
+    avg_corr = float(np.mean(correlations)) if correlations else 0.0
 
     return {
         'loss': total_loss / num_batches,
         'emb_mse': total_emb_loss / num_batches,
         'tok_mse': total_tok_loss / num_batches,
-        'cos_sim': cos_sim,
+        'cos_sim': float(cos_sim),
         'avg_corr': avg_corr,
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train student model via distillation")
-    parser.add_argument('--input', '-i', type=Path, required=True,
+    parser.add_argument('--input', '-i', type=Path, default="d:/neuro_datasets/derivatives/labram_bids_outputs.hdf5",
                        help="HDF5 file with LaBraM outputs")
-    parser.add_argument('--output', '-o', type=Path, default=Path('checkpoints/student.pth'),
+    parser.add_argument('--output', '-o', type=Path, default=Path('checkpoints/student_small.pth'),
                        help="Output checkpoint path")
     parser.add_argument('--model', type=str, default='small',
                        choices=['tiny', 'small', 'base'],

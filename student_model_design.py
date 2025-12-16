@@ -598,7 +598,7 @@ class DistillationLoss(nn.Module):
 # Training utilities
 # =============================================================================
 
-class EEGDistillationDataset(torch.utils.data.Dataset):
+class EEGDistillationDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]]):
     """Dataset for loading LaBraM inference outputs for distillation training.
 
     Loads from HDF5 file created by run_labram_inference.py.
@@ -617,56 +617,72 @@ class EEGDistillationDataset(torch.utils.data.Dataset):
         self.load_tokens = load_tokens
 
         # Index all windows across recordings
-        self.windows = []  # List of (recording_name, window_idx)
+        self.windows: list[tuple[str, int]] = []
 
         with h5py.File(h5_path, 'r') as f:
             for rec_name in f.keys():
-                grp = f[rec_name]
+                item = f[rec_name]
+                if not isinstance(item, h5py.Group):
+                    continue
+                grp: h5py.Group = item
+
                 if 'embeddings' not in grp:
                     continue
 
-                num_windows = grp['embeddings'].shape[0]
+                emb_dset = grp['embeddings']
+                if not isinstance(emb_dset, h5py.Dataset):
+                    continue
+
+                num_windows: int = emb_dset.shape[0]
 
                 # Check for valid data (skip NaN-only recordings)
-                emb_sample = grp['embeddings'][0]
+                emb_sample = emb_dset[0]
                 if any(~torch.isnan(torch.tensor(emb_sample))):
                     for i in range(num_windows):
                         self.windows.append((rec_name, i))
 
         print(f"Loaded {len(self.windows)} windows from {h5_path}")
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.windows)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         import h5py
 
         rec_name, window_idx = self.windows[idx]
 
         with h5py.File(self.h5_path, 'r') as f:
-            grp = f[rec_name]
+            item = f[rec_name]
+            assert isinstance(item, h5py.Group)
+            grp: h5py.Group = item
 
             # Load input window
-            inputs = grp['inputs'][window_idx]  # [N, A, T]
+            inputs_dset = grp['inputs']
+            assert isinstance(inputs_dset, h5py.Dataset)
+            inputs_arr = inputs_dset[window_idx]  # [N, A, T]
             if self.normalize_inputs:
-                inputs = inputs / 100.0  # LaBraM normalization
+                inputs_arr = inputs_arr / 100.0  # LaBraM normalization
 
             # Load teacher embeddings
-            embedding = grp['embeddings'][window_idx]  # [D]
+            emb_dset = grp['embeddings']
+            assert isinstance(emb_dset, h5py.Dataset)
+            embedding_arr = emb_dset[window_idx]  # [D]
 
             # Load input channel indices
             input_chans = grp.attrs['input_chans']  # Includes CLS position
 
-            result = {
-                'inputs': torch.tensor(inputs, dtype=torch.float32),
-                'embedding': torch.tensor(embedding, dtype=torch.float32),
+            result: dict[str, torch.Tensor] = {
+                'inputs': torch.tensor(inputs_arr, dtype=torch.float32),
+                'embedding': torch.tensor(embedding_arr, dtype=torch.float32),
                 'input_chans': torch.tensor(input_chans, dtype=torch.long),
             }
 
             # Optionally load token embeddings
             if self.load_tokens and 'token_embeddings' in grp:
-                tokens = grp['token_embeddings'][window_idx]  # [S, D]
-                result['tokens'] = torch.tensor(tokens, dtype=torch.float32)
+                tok_dset = grp['token_embeddings']
+                assert isinstance(tok_dset, h5py.Dataset)
+                tokens_arr = tok_dset[window_idx]  # [S, D]
+                result['tokens'] = torch.tensor(tokens_arr, dtype=torch.float32)
 
             return result
 
