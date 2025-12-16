@@ -33,277 +33,13 @@ if str(SCRIPT_DIR) not in sys.path:
 from timm.models import create_model
 import modeling_finetune  # Register LaBraM models with timm
 
-# Standard 10-20 electrode positions used by LaBraM
-STANDARD_1020 = [
-    'FP1', 'FPZ', 'FP2',
-    'AF9', 'AF7', 'AF5', 'AF3', 'AF1', 'AFZ', 'AF2', 'AF4', 'AF6', 'AF8', 'AF10',
-    'F9', 'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6', 'F8', 'F10',
-    'FT9', 'FT7', 'FC5', 'FC3', 'FC1', 'FCZ', 'FC2', 'FC4', 'FC6', 'FT8', 'FT10',
-    'T9', 'T7', 'C5', 'C3', 'C1', 'CZ', 'C2', 'C4', 'C6', 'T8', 'T10',
-    'TP9', 'TP7', 'CP5', 'CP3', 'CP1', 'CPZ', 'CP2', 'CP4', 'CP6', 'TP8', 'TP10',
-    'P9', 'P7', 'P5', 'P3', 'P1', 'PZ', 'P2', 'P4', 'P6', 'P8', 'P10',
-    'PO9', 'PO7', 'PO5', 'PO3', 'PO1', 'POZ', 'PO2', 'PO4', 'PO6', 'PO8', 'PO10',
-    'O1', 'OZ', 'O2', 'O9', 'CB1', 'CB2',
-    'IZ', 'O10', 'T3', 'T5', 'T4', 'T6', 'M1', 'M2', 'A1', 'A2',
-    'CFC1', 'CFC2', 'CFC3', 'CFC4', 'CFC5', 'CFC6', 'CFC7', 'CFC8',
-    'CCP1', 'CCP2', 'CCP3', 'CCP4', 'CCP5', 'CCP6', 'CCP7', 'CCP8',
-    'T1', 'T2', 'FTT9h', 'TTP7h', 'TPP9h', 'FTT10h', 'TPP8h', 'TPP10h',
-    "FP1-F7", "F7-T7", "T7-P7", "P7-O1", "FP2-F8", "F8-T8", "T8-P8", "P8-O2",
-    "FP1-F3", "F3-C3", "C3-P3", "P3-O1", "FP2-F4", "F4-C4", "C4-P4", "P4-O2"
-]
-
-# Channel alias mapping for non-standard electrode systems
-# Maps non-standard names -> closest standard 10-20 position
-# See CHANNEL_MAPPING.md for anatomical rationale
-CHANNEL_ALIASES: dict[str, str] = {
-    # =========================================================================
-    # cEEGrid: Around-the-ear electrode array (L=left, R=right, 1-8 = anterior to posterior)
-    # Reference: Debener et al. "Unobtrusive ambulatory EEG using a smartphone"
-    # Electrodes curve around the ear from preauricular (front) to mastoid (back)
-    # =========================================================================
-    'L1': 'FT9',   # Left anterior (in front of ear, level with tragus) -> fronto-temporal
-    'L2': 'T9',    # Left upper anterior -> inferior temporal
-    'L3': 'T7',    # Left at ear level -> temporal (T7/T3)
-    'L4': 'TP9',   # Left upper posterior -> temporo-parietal
-    'L4A': 'TP9',  # Left upper posterior variant A
-    'L4B': 'TP9',  # Left upper posterior variant B
-    'L5': 'TP9',   # Left mid posterior -> temporo-parietal
-    'L6': 'M1',    # Left lower posterior -> left mastoid
-    'L7': 'M1',    # Left mastoid area -> left mastoid
-    'L8': 'M1',    # Left inferior mastoid -> left mastoid
-    'R1': 'FT10',  # Right anterior -> fronto-temporal
-    'R2': 'T10',   # Right upper anterior -> inferior temporal
-    'R3': 'T8',    # Right at ear level -> temporal (T8/T4)
-    'R4': 'TP10',  # Right upper posterior -> temporo-parietal
-    'R4A': 'TP10', # Right upper posterior variant A
-    'R4B': 'TP10', # Right upper posterior variant B
-    'R5': 'TP10',  # Right mid posterior -> temporo-parietal
-    'R6': 'M2',    # Right lower posterior -> right mastoid
-    'R7': 'M2',    # Right mastoid area -> right mastoid
-    'R8': 'M2',    # Right inferior mastoid -> right mastoid
-
-    # =========================================================================
-    # earEEG / In-ear EEG: Electrodes placed in or around the ear canal
-    # These are all near the external auditory meatus, closest to T9/T10 and mastoids
-    # =========================================================================
-    'LB': 'T9',    # Left Bottom (lower ear canal) -> inferior temporal
-    'LT': 'T9',    # Left Top (upper ear canal) -> inferior temporal
-    'RB': 'T10',   # Right Bottom -> inferior temporal
-    'RT': 'T10',   # Right Top -> inferior temporal
-    'ELE': 'T9',   # Generic ear electrode -> default to left inferior temporal
-    'LE': 'T9',    # Left Ear generic
-    'RE': 'T10',   # Right Ear generic
-    'LEA': 'T9',   # Left Ear A
-    'LEB': 'T9',   # Left Ear B
-    'REA': 'T10',  # Right Ear A
-    'REB': 'T10',  # Right Ear B
-
-    # =========================================================================
-    # IDUN Guardian earbuds: In-ear EEG with 3 electrodes per ear
-    # =========================================================================
-    'L_A': 'T9',   # Left electrode A
-    'L_B': 'T9',   # Left electrode B
-    'L_C': 'T9',   # Left electrode C
-    'R_A': 'T10',  # Right electrode A
-    'R_B': 'T10',  # Right electrode B
-    'R_C': 'T10',  # Right electrode C
-
-    # =========================================================================
-    # Muse headband: Forehead + behind-ear electrodes
-    # =========================================================================
-    'TP9_MUSE': 'TP9',   # Left behind ear
-    'AF7_MUSE': 'AF7',   # Left forehead
-    'AF8_MUSE': 'AF8',   # Right forehead
-    'TP10_MUSE': 'TP10', # Right behind ear
-
-    # =========================================================================
-    # Emotiv EPOC/EPOC+: 14-channel headset with non-standard naming
-    # =========================================================================
-    'AF3_EMOTIV': 'AF3',
-    'F7_EMOTIV': 'F7',
-    'F3_EMOTIV': 'F3',
-    'FC5_EMOTIV': 'FC5',
-    'T7_EMOTIV': 'T7',
-    'P7_EMOTIV': 'P7',
-    'O1_EMOTIV': 'O1',
-    'O2_EMOTIV': 'O2',
-    'P8_EMOTIV': 'P8',
-    'T8_EMOTIV': 'T8',
-    'FC6_EMOTIV': 'FC6',
-    'F4_EMOTIV': 'F4',
-    'F8_EMOTIV': 'F8',
-    'AF4_EMOTIV': 'AF4',
-
-    # =========================================================================
-    # Alternative temporal electrode names (older 10-20 naming)
-    # =========================================================================
-    'T3': 'T7',    # Old name for T7 (left temporal)
-    'T4': 'T8',    # Old name for T8 (right temporal)
-    'T5': 'P7',    # Old name for P7 (left posterior temporal)
-    'T6': 'P8',    # Old name for P8 (right posterior temporal)
-
-    # =========================================================================
-    # Common reference electrode aliases
-    # =========================================================================
-    'MASTL': 'M1',  # Left mastoid
-    'MASTR': 'M2',  # Right mastoid
-    'LMAS': 'M1',
-    'RMAS': 'M2',
-    'LM': 'M1',
-    'RM': 'M2',
-    'EARR': 'A2',   # Right ear reference
-    'EARL': 'A1',   # Left ear reference
-
-    # =========================================================================
-    # OpenBCI Cyton default channel names (when not configured)
-    # Maps to common clinical montage positions
-    # =========================================================================
-    'EXG1': 'FP1',
-    'EXG2': 'FP2',
-    'EXG3': 'C3',
-    'EXG4': 'C4',
-    'EXG5': 'P7',
-    'EXG6': 'P8',
-    'EXG7': 'O1',
-    'EXG8': 'O2',
-
-    # =========================================================================
-    # PSG (Polysomnography) with prefix: PSG_F3 -> F3, etc.
-    # =========================================================================
-    'PSG_F3': 'F3',
-    'PSG_F4': 'F4',
-    'PSG_C3': 'C3',
-    'PSG_C4': 'C4',
-    'PSG_O1': 'O1',
-    'PSG_O2': 'O2',
-    'PSG_FP1': 'FP1',
-    'PSG_FP2': 'FP2',
-    'PSG_FZ': 'FZ',
-    'PSG_CZ': 'CZ',
-    'PSG_PZ': 'PZ',
-    'PSG_OZ': 'OZ',
-    'PSG_T3': 'T7',
-    'PSG_T4': 'T8',
-    'PSG_T5': 'P7',
-    'PSG_T6': 'P8',
-    # EOG/EMG channels are not EEG - no mapping (will be skipped)
-
-    # =========================================================================
-    # Generic headband devices (2-4 channel forehead EEG)
-    # Assumes left-right forehead placement
-    # =========================================================================
-    'HB_1': 'AF7',   # Headband channel 1 -> left forehead
-    'HB_2': 'AF8',   # Headband channel 2 -> right forehead
-    'HB_3': 'FP1',   # Headband channel 3 -> left frontal pole
-    'HB_4': 'FP2',   # Headband channel 4 -> right frontal pole
-    'HEADBAND_L': 'AF7',
-    'HEADBAND_R': 'AF8',
-    'FOREHEAD_L': 'AF7',
-    'FOREHEAD_R': 'AF8',
-    'FRONT_L': 'AF7',
-    'FRONT_R': 'AF8',
-
-    # =========================================================================
-    # Dreem headband: 5 dry electrodes on forehead/back of head
-    # =========================================================================
-    'F7_DREEM': 'F7',
-    'F8_DREEM': 'F8',
-    'FPZ_DREEM': 'FPZ',
-    'O1_DREEM': 'O1',
-    'O2_DREEM': 'O2',
-
-    # =========================================================================
-    # EASYCAP Equidistant Cap (ds004460 Spot Rotation dataset)
-    # Auto-generated mapping based on 3D electrode coordinates
-    # NOTE: R1-R32 mappings CONFLICT with cEEGrid R1-R8. If using this dataset,
-    # you may need to comment out the cEEGrid R* mappings above.
-    # Only G, W, Y channels are included here to avoid conflicts.
-    # =========================================================================
-    # G (Green) group - right anterior/lateral
-    'G1': 'FP2',
-    'G2': 'FP2',
-    'G3': 'FP2',
-    'G4': 'AF4',
-    'G5': 'FP2',
-    'G6': 'FP2',
-    'G7': 'AF8',
-    'G8': 'AF4',
-    'G9': 'AF8',
-    'G10': 'F8',
-    'G11': 'F8',
-    'G12': 'FT8',
-    'G14': 'T8',
-    'G15': 'T8',
-    'G16': 'FT10',
-    'G17': 'T8',
-    'G18': 'T10',
-    'G19': 'TP8',
-    'G20': 'TP8',
-    'G21': 'P8',
-    'G22': 'P8',
-    'G23': 'PO8',
-    'G24': 'P6',
-    'G25': 'PO8',
-    'G26': 'PO8',
-    'G27': 'M2',
-    'G28': 'PO4',
-    'G29': 'PO4',
-    'G30': 'O2',
-    'G31': 'O2',
-    'G32': 'M2',
-    # W (White) group - left hemisphere
-    'W1': 'FP1',
-    'W2': 'AF7',
-    'W3': 'FC5',
-    'W4': 'FP1',
-    'W5': 'AF3',
-    'W6': 'AF3',
-    'W7': 'FC5',
-    'W8': 'FC5',
-    'W9': 'FC5',
-    'W10': 'AF3',
-    'W11': 'F3',
-    'W12': 'F3',
-    'W13': 'FC3',
-    'W14': 'FC3',
-    'W15': 'C3',
-    'W16': 'C3',
-    'W17': 'C3',
-    'W18': 'C3',
-    'W19': 'CP3',
-    'W20': 'P3',
-    'W21': 'PO3',
-    'W22': 'C5',
-    'W23': 'C5',
-    'W24': 'CP5',
-    'W25': 'P5',
-    'W26': 'P5',
-    'W27': 'PO3',
-    'W28': 'C5',
-    'W29': 'CP5',
-    'W30': 'P7',
-    'W31': 'P7',
-    'W32': 'PO7',
-    # Y (Yellow) group - right posterior/central
-    'Y1': 'AF4',
-    'Y2': 'F4',
-    'Y5': 'AF4',
-    'Y6': 'F4',
-    'Y7': 'FC4',
-    'Y19': 'C4',
-    'Y20': 'C4',
-    'Y22': 'CP6',
-    'Y23': 'P6',
-    'Y24': 'C4',
-    'Y25': 'CP4',
-    'Y26': 'P4',
-    'Y27': 'P4',
-    'Y28': 'C2',
-    'Y29': 'C2',
-    'Y30': 'CP2',
-    'Y31': 'P4',
-    'Y32': 'P2',
-}
+# Import channel mappings from separate module
+from channel_maps import (
+    STANDARD_1020,
+    CHANNEL_MAPS,
+    get_channel_map,
+    list_channel_maps,
+)
 
 LOGGER = logging.getLogger("labram.inference")
 
@@ -384,22 +120,47 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
+    parser.add_argument(
+        "--channel-map",
+        type=str,
+        nargs="+",
+        default=None,
+        help=f"Channel map(s) to use for electrode name mapping. "
+             f"Available: {list_channel_maps()}. Multiple maps can be specified "
+             f"(later maps override earlier). Default: all common maps except ds004460.",
+    )
+    parser.add_argument(
+        "--list-channel-maps",
+        action="store_true",
+        help="List available channel maps and exit",
+    )
     return parser.parse_args()
 
 
-def get_input_chans(ch_names: List[str]) -> tuple[List[int], List[int], List[str]]:
+def get_input_chans(
+    ch_names: List[str],
+    channel_aliases: Optional[dict[str, str]] = None
+) -> tuple[List[int], List[int], List[str]]:
     """Map channel names to standard 10-20 positions for LaBraM.
+
+    Args:
+        ch_names: List of channel names from the EEG recording.
+        channel_aliases: Optional dict mapping non-standard names to 10-20 positions.
+            If None, uses default mappings from get_channel_map().
 
     Handles:
     - Standard 10-20 names (FP1, CZ, O2, etc.)
     - Reference notation (C4:A1 -> C4, O2-A1 -> O2)
-    - Non-standard systems via CHANNEL_ALIASES (cEEGrid, earEEG, etc.)
+    - Non-standard systems via channel_aliases (cEEGrid, earEEG, etc.)
 
     Returns:
         input_chans: Position embedding indices (starts with 0 for CLS token)
         valid_eeg_indices: Indices into the original EEG array for valid channels
         valid_ch_names: Names of valid channels
     """
+    if channel_aliases is None:
+        channel_aliases = get_channel_map()
+
     input_chans = [0]  # CLS token position
     valid_eeg_indices: List[int] = []
     valid_ch_names: List[str] = []
@@ -418,8 +179,8 @@ def get_input_chans(ch_names: List[str]) -> tuple[List[int], List[int], List[str
             continue
 
         # Try alias mapping for non-standard electrode systems
-        if ch_base in CHANNEL_ALIASES:
-            mapped_name = CHANNEL_ALIASES[ch_base]
+        if ch_base in channel_aliases:
+            mapped_name = channel_aliases[ch_base]
             idx = STANDARD_1020.index(mapped_name) + 1
             input_chans.append(idx)
             valid_eeg_indices.append(i)
@@ -581,6 +342,21 @@ def main():
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
+    # Handle --list-channel-maps
+    if args.list_channel_maps:
+        print("Available channel maps:")
+        for name in list_channel_maps():
+            map_data = CHANNEL_MAPS[name]
+            print(f"  {name}: {len(map_data)} mappings")
+        print("\nUse --channel-map <name> [<name2> ...] to select maps.")
+        print("Example: --channel-map ds004460  (for EASYCAP equidistant cap)")
+        print("Example: --channel-map ceegrid eareeg  (for cEEGrid + earEEG)")
+        return
+
+    # Build channel alias map from --channel-map argument
+    channel_aliases = get_channel_map(args.channel_map)
+    LOGGER.info(f"Using channel maps: {args.channel_map or 'default'} ({len(channel_aliases)} aliases)")
+
     # Validate paths
     if not args.input.exists():
         raise FileNotFoundError(f"Input file not found: {args.input}")
@@ -655,7 +431,9 @@ def main():
                     ch_order = [f"CH{i}" for i in range(eeg_data.shape[0])]
 
                 # Get input channel mapping and filter to valid channels
-                input_chans, valid_eeg_indices, valid_ch_names = get_input_chans(ch_order)
+                input_chans, valid_eeg_indices, valid_ch_names = get_input_chans(
+                    ch_order, channel_aliases
+                )
 
                 # Check if we have enough valid channels
                 if len(input_chans) < 2:  # Only CLS token

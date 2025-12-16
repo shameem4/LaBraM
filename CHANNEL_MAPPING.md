@@ -12,13 +12,51 @@ LaBraM uses position embeddings based on the extended 10-20 system. When process
 - Results from ear-based electrodes should be interpreted with caution
 - Multiple non-standard electrodes may map to the same 10-20 position
 
+## Channel Map System
+
+Channel mappings are defined in `channel_maps.py` and organized by dataset/device. This allows different datasets to use the same channel names with different meanings (e.g., R1 means different things for cEEGrid vs ds004460).
+
+### Available Channel Maps
+
+| Map Name | Description | Channels |
+|----------|-------------|----------|
+| `default` | Legacy 10-20 aliases, reference electrodes | ~10 |
+| `ceegrid` | cEEGrid around-the-ear array | L1-L8, R1-R8 |
+| `eareeg` | In-ear EEG electrodes | LB, LT, RB, RT, etc. |
+| `idun` | IDUN Guardian earbuds | L_A-L_C, R_A-R_C |
+| `muse` | Muse headband | TP9, AF7, AF8, TP10 |
+| `emotiv` | Emotiv EPOC/EPOC+ | 14 channels |
+| `openbci` | OpenBCI Cyton defaults | EXG1-EXG8 |
+| `psg` | PSG with prefix | PSG_F3, PSG_C4, etc. |
+| `headband` | Generic headband | HB_1-HB_4 |
+| `dreem` | Dreem headband | 5 channels |
+| `ds004460` | EASYCAP equidistant cap | G1-G32, R1-R32, W1-W32, Y1-Y32 |
+
+### Usage
+
+```bash
+# List available channel maps
+python run_labram_inference.py --list-channel-maps
+
+# Use default maps (all except ds004460)
+python run_labram_inference.py --input data.hdf5
+
+# Use specific maps (later maps override earlier)
+python run_labram_inference.py --input data.hdf5 --channel-map ds004460
+
+# Combine multiple maps
+python run_labram_inference.py --input data.hdf5 --channel-map ceegrid eareeg
+```
+
+**Important:** Some channel names conflict between maps (e.g., R1-R8 in cEEGrid vs ds004460). By default, ds004460 is NOT included to avoid conflicts. Use `--channel-map ds004460` explicitly when processing that dataset.
+
 ## Mapping Logic
 
 The channel matching follows this priority:
 
 1. **Direct match**: Standard 10-20 names (FP1, CZ, O2, etc.)
 2. **Reference stripping**: Remove reference notation (`C4:A1` → `C4`, `O2-A1` → `O2`)
-3. **Alias lookup**: Map via `CHANNEL_ALIASES` dictionary
+3. **Alias lookup**: Map via selected channel maps
 
 ---
 
@@ -220,19 +258,24 @@ PSG recordings often use reference notation like `C4:A1` (C4 referenced to left 
 
 ## Adding Custom Mappings
 
-To add mappings for additional electrode systems, edit the `CHANNEL_ALIASES` dictionary in `run_labram_inference.py`:
+To add mappings for additional electrode systems, edit `channel_maps.py`:
 
 ```python
-CHANNEL_ALIASES: dict[str, str] = {
-    # ... existing mappings ...
+CHANNEL_MAPS: Dict[str, Dict[str, str]] = {
+    # ... existing maps ...
 
     # Your custom system
-    'CUSTOM1': 'FP1',  # Map CUSTOM1 to standard FP1
-    'CUSTOM2': 'CZ',   # Map CUSTOM2 to standard CZ
+    "my_device": {
+        'CUSTOM1': 'FP1',  # Map CUSTOM1 to standard FP1
+        'CUSTOM2': 'CZ',   # Map CUSTOM2 to standard CZ
+    },
 }
 ```
 
+Then use it with: `--channel-map my_device`
+
 Guidelines for choosing mappings:
+
 1. Consider the anatomical location of the electrode
 2. Choose the nearest standard 10-20 position
 3. When in doubt, prefer temporal positions (T7/T8/T9/T10) for ear-adjacent electrodes
@@ -244,7 +287,14 @@ Guidelines for choosing mappings:
 
 Mappings for high-density equidistant electrode caps have been auto-generated using `map_equidistant_to_1020.py`, which matches electrode 3D coordinates to nearest standard 10-20 positions.
 
+**Usage:**
+
+```bash
+python run_labram_inference.py --input ds004460.hdf5 --channel-map ds004460
+```
+
 **Dataset details:**
+
 - 157 channels: G01-G32, Y01-Y32, R01-R32, W01-W32, N01-N32
 - Channel names are amplifier group labels (Green, Yellow, Red, White, Neck)
 - Electrodes placed in equidistant pattern, mapped to closest 10-20 positions
@@ -259,22 +309,7 @@ Mappings for high-density equidistant electrode caps have been auto-generated us
 | Red | R1-R32 | Midline | AFZ, FZ, CZ, PZ, POZ |
 | Neck | N1-N32 | - | Not mapped (excluded) |
 
-**Known conflict:** R1-R8 from the equidistant cap conflict with cEEGrid R1-R8 mappings (around-the-ear electrodes). The equidistant R channels are NOT included in the default aliases. If processing ds004460 data, you have two options:
-
-1. **Comment out cEEGrid R mappings**: Edit `run_labram_inference.py` and comment out `'R1': 'FT10'` through `'R8': 'M2'`, then add:
-
-   ```python
-   # ds004460 R (Red) group - midline
-   'R1': 'AFZ', 'R2': 'AFZ', 'R3': 'AFZ', 'R4': 'FZ', 'R5': 'F3',
-   'R6': 'FZ', 'R7': 'FZ', 'R8': 'FZ', 'R9': 'FC1', 'R10': 'F4',
-   'R11': 'FZ', 'R12': 'FCZ', 'R13': 'CZ', 'R14': 'FC2', 'R15': 'FCZ',
-   'R16': 'CZ', 'R17': 'CZ', 'R18': 'CP2', 'R19': 'CZ', 'R20': 'CPZ',
-   'R21': 'P2', 'R22': 'P2', 'R23': 'C1', 'R24': 'C1', 'R25': 'CP1',
-   'R26': 'P1', 'R27': 'PZ', 'R28': 'CP3', 'R29': 'P1', 'R30': 'P1',
-   'R31': 'POZ', 'R32': 'POZ',
-   ```
-
-2. **Rename channels in preprocessing**: Rename R channels in your HDF5 to use a different prefix (e.g., `RED1`, `RED2`, etc.)
+**Conflict resolution:** R1-R8 from the equidistant cap conflict with cEEGrid R1-R8. The `ds004460` map is NOT included by default. Use `--channel-map ds004460` explicitly when processing this dataset. Do NOT combine with `ceegrid`.
 
 **Generating custom mappings:** Use `map_equidistant_to_1020.py` with subject-specific electrode coordinates:
 
@@ -295,7 +330,8 @@ python run_labram_inference.py --log-level DEBUG ...
 ```
 
 Then either:
-1. Add mappings to `CHANNEL_ALIASES` for your electrode names
+
+1. Add mappings to `channel_maps.py` and use `--channel-map your_map`
 2. Rename channels in your source data preprocessing
 
 ### Multiple channels mapping to same position
