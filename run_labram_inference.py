@@ -163,7 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-level",
         type=str,
-        default="INFO",
+        default="WARNING",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
@@ -211,6 +211,42 @@ def get_input_chans(
     if channel_aliases is None:
         channel_aliases = get_channel_map()
 
+    def _candidate_labels(label: str) -> List[str]:
+        """Generate progressively-simplified candidate labels for matching.
+
+        This helps handle vendor prefixes like "BRAINVISION RDA_G01" by trying
+        "RDA_G01" -> "G01" -> "G1".
+        """
+        candidates: List[str] = []
+        if label:
+            candidates.append(label)
+
+        # Last whitespace token (e.g., "BRAINVISION RDA_G01" -> "RDA_G01")
+        if " " in label:
+            candidates.append(label.split()[-1])
+
+        # Last underscore token (e.g., "RDA_G01" -> "G01")
+        last = candidates[-1] if candidates else label
+        if "_" in last:
+            candidates.append(last.split("_")[-1])
+
+        # Normalize zero-padded numeric suffix (e.g., "G01" -> "G1")
+        normalized: List[str] = []
+        for cand in candidates:
+            m = re.match(r"^([A-Z]+)0+(\d+)$", cand)
+            if m:
+                normalized.append(f"{m.group(1)}{m.group(2)}")
+        candidates.extend(normalized)
+
+        # De-duplicate while preserving order
+        out: List[str] = []
+        seen = set()
+        for cand in candidates:
+            if cand and cand not in seen:
+                out.append(cand)
+                seen.add(cand)
+        return out
+
     input_chans = [0]  # CLS token position
     valid_eeg_indices: List[int] = []
     valid_ch_names: List[str] = []
@@ -220,29 +256,37 @@ def get_input_chans(
         # Strip reference notation (e.g., "C4:A1" -> "C4", "O2-A1" -> "O2")
         ch_base = ch_upper.split(':')[0].split('-')[0].strip()
 
-        # If an explicit alias is provided for this channel name, prefer it.
-        # This allows dataset-specific maps to override ambiguous labels that
-        # may also appear in STANDARD_1020 (e.g., BioSemi "A1" is not mastoid A1).
-        if ch_base in channel_aliases:
-            mapped_name = channel_aliases[ch_base]
-            if mapped_name in STANDARD_1020:
-                idx = STANDARD_1020.index(mapped_name) + 1
+        matched = False
+        for cand in _candidate_labels(ch_base):
+            # If an explicit alias is provided for this channel name, prefer it.
+            # This allows dataset-specific maps to override ambiguous labels that
+            # may also appear in STANDARD_1020 (e.g., BioSemi "A1" is not mastoid A1).
+            if cand in channel_aliases:
+                mapped_name = channel_aliases[cand]
+                if mapped_name in STANDARD_1020:
+                    idx = STANDARD_1020.index(mapped_name) + 1
+                    input_chans.append(idx)
+                    valid_eeg_indices.append(i)
+                    valid_ch_names.append(ch_name)
+                    LOGGER.debug(f"Channel '{ch_name}' mapped via alias: {cand} -> {mapped_name}")
+                    matched = True
+                    break
+                LOGGER.debug(
+                    f"Channel '{ch_name}' alias target '{mapped_name}' is not in standard 10-20 list, skipping"
+                )
+                matched = True
+                break
+
+            # Direct standard match
+            if cand in STANDARD_1020:
+                idx = STANDARD_1020.index(cand) + 1
                 input_chans.append(idx)
                 valid_eeg_indices.append(i)
                 valid_ch_names.append(ch_name)
-                LOGGER.debug(f"Channel '{ch_name}' mapped via alias: {ch_base} -> {mapped_name}")
-                continue
-            LOGGER.debug(
-                f"Channel '{ch_name}' alias target '{mapped_name}' is not in standard 10-20 list, skipping"
-            )
-            continue
+                matched = True
+                break
 
-        # Try direct match first
-        if ch_base in STANDARD_1020:
-            idx = STANDARD_1020.index(ch_base) + 1
-            input_chans.append(idx)
-            valid_eeg_indices.append(i)
-            valid_ch_names.append(ch_name)
+        if matched:
             continue
 
         LOGGER.debug(f"Channel '{ch_name}' (base: '{ch_base}') not in standard 10-20 or aliases, skipping")
