@@ -419,7 +419,16 @@ class NeuralTransformer(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, x, input_chans=None, return_patch_tokens=False, return_all_tokens=False, **kwargs):
+    def forward_features(
+        self,
+        x,
+        input_chans=None,
+        return_patch_tokens=False,
+        return_all_tokens=False,
+        return_pooled_and_patch_tokens: bool = False,
+        return_pooled_and_all_tokens: bool = False,
+        **kwargs,
+    ):
         batch_size, n, a, t = x.shape
         input_time_window = a if t == self.patch_size else t
         x = self.patch_embed(x)
@@ -459,6 +468,16 @@ class NeuralTransformer(nn.Module):
         
         x = self.norm(x)
         if self.fc_norm is not None:
+            if return_pooled_and_all_tokens:
+                t = x[:, 1:, :]
+                pooled = self.fc_norm(t.mean(1))
+                all_tokens = self.fc_norm(x)
+                return pooled, all_tokens
+            if return_pooled_and_patch_tokens:
+                t = x[:, 1:, :]
+                pooled = self.fc_norm(t.mean(1))
+                patch_tokens = self.fc_norm(t)
+                return pooled, patch_tokens
             if return_all_tokens:
                 return self.fc_norm(x)
             t = x[:, 1:, :]
@@ -467,6 +486,10 @@ class NeuralTransformer(nn.Module):
             else:
                 return self.fc_norm(t.mean(1))
         else:
+            if return_pooled_and_all_tokens:
+                return x[:, 0], x
+            if return_pooled_and_patch_tokens:
+                return x[:, 0], x[:, 1:]
             if return_all_tokens:
                 return x
             elif return_patch_tokens:
@@ -474,12 +497,33 @@ class NeuralTransformer(nn.Module):
             else:
                 return x[:, 0]
 
-    def forward(self, x, input_chans=None, return_patch_tokens=False, return_all_tokens=False, **kwargs):
+    def forward(
+        self,
+        x,
+        input_chans=None,
+        return_patch_tokens=False,
+        return_all_tokens=False,
+        return_pooled_and_patch_tokens: bool = False,
+        return_pooled_and_all_tokens: bool = False,
+        **kwargs,
+    ):
         '''
         x: [batch size, number of electrodes, number of patches, patch size]
         For example, for an EEG sample of 4 seconds with 64 electrodes, x will be [batch size, 64, 4, 200]
         '''
-        x = self.forward_features(x, input_chans=input_chans, return_patch_tokens=return_patch_tokens, return_all_tokens=return_all_tokens, **kwargs)
+        x = self.forward_features(
+            x,
+            input_chans=input_chans,
+            return_patch_tokens=return_patch_tokens,
+            return_all_tokens=return_all_tokens,
+            return_pooled_and_patch_tokens=return_pooled_and_patch_tokens,
+            return_pooled_and_all_tokens=return_pooled_and_all_tokens,
+            **kwargs,
+        )
+        if isinstance(x, tuple):
+            if not isinstance(self.head, nn.Identity):
+                raise RuntimeError("Tuple outputs require num_classes=0 (head=Identity)")
+            return x
         x = self.head(x)
         return x
 

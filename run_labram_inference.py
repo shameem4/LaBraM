@@ -183,6 +183,23 @@ def parse_args() -> argparse.Namespace:
         choices=["float16", "float32"],
         help="Data type for saved token_embeddings (float16 saves disk/RAM).",
     )
+
+    parser.add_argument(
+        "--compression",
+        type=str,
+        default="lzf",
+        choices=["gzip", "lzf", "none"],
+        help=(
+            "HDF5 compression for saved datasets. 'lzf' is usually much faster than gzip. "
+            "Use 'none' for maximum speed (largest files)."
+        ),
+    )
+    parser.add_argument(
+        "--compression-level",
+        type=int,
+        default=4,
+        help="gzip compression level (only used when --compression=gzip).",
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -486,19 +503,26 @@ def run_inference_write_h5(
 
         batch_tensor = torch.from_numpy(batch).float().to(device) / 100.0
 
-        # Pooled embedding (matches current script behavior)
-        pooled = model(batch_tensor, input_chans=input_chans)
-        embeddings_dset[start_idx:end_idx] = pooled.detach().cpu().numpy().astype(np.float32, copy=False)
-
-        # Optional token embeddings
+        # If we're saving tokens, avoid running the model twice.
         if token_embeddings_dset is not None:
             if tokens_include_cls:
-                tokens = model(batch_tensor, input_chans=input_chans, return_all_tokens=True)
+                pooled, tokens = model(
+                    batch_tensor,
+                    input_chans=input_chans,
+                    return_pooled_and_all_tokens=True,
+                )
             else:
-                tokens = model(batch_tensor, input_chans=input_chans, return_patch_tokens=True)
-            token_embeddings_dset[start_idx:end_idx] = (
-                tokens.detach().cpu().numpy().astype(token_dtype, copy=False)
-            )
+                pooled, tokens = model(
+                    batch_tensor,
+                    input_chans=input_chans,
+                    return_pooled_and_patch_tokens=True,
+                )
+            embeddings_dset[start_idx:end_idx] = pooled.detach().cpu().numpy().astype(np.float32, copy=False)
+            token_embeddings_dset[start_idx:end_idx] = tokens.detach().cpu().numpy().astype(token_dtype, copy=False)
+        else:
+            # Pooled embedding only (matches previous behavior)
+            pooled = model(batch_tensor, input_chans=input_chans)
+            embeddings_dset[start_idx:end_idx] = pooled.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
 def main():
@@ -545,6 +569,14 @@ def main():
     embed_dim = model.embed_dim
 
     token_dtype: Type[np.floating] = np.float16 if args.token_dtype == "float16" else np.float32
+
+    def _h5_compression_kwargs() -> dict:
+        if args.compression == "none":
+            return {}
+        if args.compression == "lzf":
+            return {"compression": "lzf"}
+        # gzip
+        return {"compression": "gzip", "compression_opts": int(args.compression_level)}
 
     # Open input and output HDF5 files
     LOGGER.info(f"Opening input file: {args.input}")
@@ -665,31 +697,31 @@ def main():
                 # Pre-create datasets and write in batches (important for token-level outputs).
                 num_windows = int(windows.shape[0])
 
+                # Chunk across the window dimension for efficient sequential writes.
+                emb_chunks = (min(args.batch_size, num_windows), embed_dim)
+
                 emb_dset = out_grp.create_dataset(
                     "embeddings",
                     shape=(num_windows, embed_dim),
                     dtype=np.float32,
-                    compression="gzip",
-                    compression_opts=4,
+                    chunks=emb_chunks,
+                    **_h5_compression_kwargs(),
                 )
 
                 tok_dset: Optional[h5py.Dataset] = None
                 if args.save_token_embeddings:
-                    # Determine token sequence length from a single forward pass on the first batch.
-                    first_batch = windows[: min(args.batch_size, num_windows)]
-                    first_tensor = torch.from_numpy(first_batch).float().to(args.device) / 100.0
-                    if args.tokens_include_cls:
-                        first_tokens = model(first_tensor, input_chans=input_chans, return_all_tokens=True)
-                    else:
-                        first_tokens = model(first_tensor, input_chans=input_chans, return_patch_tokens=True)
-                    seq_len = int(first_tokens.shape[1])
+                    # Token sequence length is deterministic for this pipeline:
+                    # patch tokens = num_channels * window_size, optionally +1 for CLS.
+                    seq_len = int(windows.shape[1] * windows.shape[2] + (1 if args.tokens_include_cls else 0))
+
+                    tok_chunks = (min(args.batch_size, num_windows), seq_len, embed_dim)
 
                     tok_dset = out_grp.create_dataset(
                         "token_embeddings",
                         shape=(num_windows, seq_len, embed_dim),
                         dtype=token_dtype,
-                        compression="gzip",
-                        compression_opts=4,
+                        chunks=tok_chunks,
+                        **_h5_compression_kwargs(),
                     )
                     out_grp.attrs["token_seq_len"] = seq_len
                     out_grp.attrs["token_includes_cls"] = bool(args.tokens_include_cls)
@@ -713,8 +745,8 @@ def main():
                         "inputs",
                         data=windows,
                         dtype=np.float32,
-                        compression="gzip",
-                        compression_opts=4,
+                        chunks=(min(args.batch_size, num_windows),) + tuple(windows.shape[1:]),
+                        **_h5_compression_kwargs(),
                     )
 
                 # Save metadata
