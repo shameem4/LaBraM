@@ -4,6 +4,10 @@ This script loads a preprocessed HDF5 dataset (created by make_bids_h5dataset.py
 runs inference through the pretrained LaBraM model, and saves both the input windows
 and corresponding LaBraM embeddings to a new HDF5 file for training custom models.
 
+It can also optionally save token-level (per-patch) embeddings for sequence-level
+distillation (student learns to match the teacher token sequence, not just the pooled
+embedding).
+
 Usage:
     python run_labram_inference.py \
         --input d:/neuro_datasets/derivatives/labram_bids.h5 \
@@ -18,7 +22,7 @@ import logging
 from pathlib import Path
 import re
 import sys
-from typing import List, Optional
+from typing import List, Optional, Type
 
 import h5py
 import numpy as np
@@ -145,14 +149,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-inputs",
         action="store_true",
-        default=False,
+        default=True,
         help="Also save the input EEG windows (default: off)",
     )
     parser.add_argument(
         "--no-save-inputs",
         dest="save_inputs",
-        action="store_false",
+        action="store_true",
+        default=False,
         help="Don't save input EEG windows, only embeddings",
+    )
+
+    parser.add_argument(
+        "--save-token-embeddings",
+        action="store_true",
+        default=True,
+        help=(
+            "Also save token-level (per-patch) embeddings to the output HDF5 under "
+            "each recording group as 'token_embeddings'. This is useful for sequence-level "
+            "distillation. Default: off"
+        ),
+    )
+    parser.add_argument(
+        "--tokens-include-cls",
+        action="store_true",
+        default=True,
+        help="If set, token_embeddings will include the CLS token as the first token.",
+    )
+    parser.add_argument(
+        "--token-dtype",
+        type=str,
+        default="float16",
+        choices=["float16", "float32"],
+        help="Data type for saved token_embeddings (float16 saves disk/RAM).",
     )
     parser.add_argument(
         "--overwrite",
@@ -436,6 +465,42 @@ def run_inference(
     return np.concatenate(all_features, axis=0)
 
 
+@torch.no_grad()
+def run_inference_write_h5(
+    model: torch.nn.Module,
+    windows: np.ndarray,
+    input_chans: List[int],
+    batch_size: int,
+    device: str,
+    embeddings_dset: h5py.Dataset,
+    token_embeddings_dset: Optional[h5py.Dataset] = None,
+    tokens_include_cls: bool = False,
+    token_dtype: Type[np.floating] = np.float16,
+) -> None:
+    """Run inference and write outputs directly into pre-created HDF5 datasets."""
+    num_windows = windows.shape[0]
+
+    for start_idx in range(0, num_windows, batch_size):
+        end_idx = min(start_idx + batch_size, num_windows)
+        batch = windows[start_idx:end_idx]
+
+        batch_tensor = torch.from_numpy(batch).float().to(device) / 100.0
+
+        # Pooled embedding (matches current script behavior)
+        pooled = model(batch_tensor, input_chans=input_chans)
+        embeddings_dset[start_idx:end_idx] = pooled.detach().cpu().numpy().astype(np.float32, copy=False)
+
+        # Optional token embeddings
+        if token_embeddings_dset is not None:
+            if tokens_include_cls:
+                tokens = model(batch_tensor, input_chans=input_chans, return_all_tokens=True)
+            else:
+                tokens = model(batch_tensor, input_chans=input_chans, return_patch_tokens=True)
+            token_embeddings_dset[start_idx:end_idx] = (
+                tokens.detach().cpu().numpy().astype(token_dtype, copy=False)
+            )
+
+
 def main():
     args = parse_args()
     logging.basicConfig(
@@ -479,6 +544,8 @@ def main():
     model = load_model(args.model, args.checkpoint, args.device)
     embed_dim = model.embed_dim
 
+    token_dtype: Type[np.floating] = np.float16 if args.token_dtype == "float16" else np.float32
+
     # Open input and output HDF5 files
     LOGGER.info(f"Opening input file: {args.input}")
 
@@ -495,6 +562,10 @@ def main():
             h5_out.attrs["stride"] = args.stride
             h5_out.attrs["patch_size"] = 200
             h5_out.attrs["embed_dim"] = embed_dim
+            h5_out.attrs["save_inputs"] = bool(args.save_inputs)
+            h5_out.attrs["save_token_embeddings"] = bool(args.save_token_embeddings)
+            h5_out.attrs["tokens_include_cls"] = bool(args.tokens_include_cls)
+            h5_out.attrs["token_dtype"] = str(args.token_dtype)
 
             # Process each recording
             recording_names = list(h5_in.keys())
@@ -588,24 +659,52 @@ def main():
                     continue
 
                 # Run inference
-                features = run_inference(
-                    model,
-                    windows,
-                    input_chans,
-                    args.batch_size,
-                    args.device,
-                )
-
                 # Create output group
                 out_grp = h5_out.create_group(rec_name)
 
-                # Save embeddings
-                out_grp.create_dataset(
+                # Pre-create datasets and write in batches (important for token-level outputs).
+                num_windows = int(windows.shape[0])
+
+                emb_dset = out_grp.create_dataset(
                     "embeddings",
-                    data=features,
+                    shape=(num_windows, embed_dim),
                     dtype=np.float32,
                     compression="gzip",
                     compression_opts=4,
+                )
+
+                tok_dset: Optional[h5py.Dataset] = None
+                if args.save_token_embeddings:
+                    # Determine token sequence length from a single forward pass on the first batch.
+                    first_batch = windows[: min(args.batch_size, num_windows)]
+                    first_tensor = torch.from_numpy(first_batch).float().to(args.device) / 100.0
+                    if args.tokens_include_cls:
+                        first_tokens = model(first_tensor, input_chans=input_chans, return_all_tokens=True)
+                    else:
+                        first_tokens = model(first_tensor, input_chans=input_chans, return_patch_tokens=True)
+                    seq_len = int(first_tokens.shape[1])
+
+                    tok_dset = out_grp.create_dataset(
+                        "token_embeddings",
+                        shape=(num_windows, seq_len, embed_dim),
+                        dtype=token_dtype,
+                        compression="gzip",
+                        compression_opts=4,
+                    )
+                    out_grp.attrs["token_seq_len"] = seq_len
+                    out_grp.attrs["token_includes_cls"] = bool(args.tokens_include_cls)
+                    out_grp.attrs["token_dtype"] = str(args.token_dtype)
+
+                run_inference_write_h5(
+                    model=model,
+                    windows=windows,
+                    input_chans=input_chans,
+                    batch_size=args.batch_size,
+                    device=args.device,
+                    embeddings_dset=emb_dset,
+                    token_embeddings_dset=tok_dset,
+                    tokens_include_cls=args.tokens_include_cls,
+                    token_dtype=token_dtype,
                 )
 
                 # Optionally save input windows
