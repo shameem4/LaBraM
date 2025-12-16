@@ -166,6 +166,143 @@ CHANNEL_ALIASES: dict[str, str] = {
     'EXG6': 'P8',
     'EXG7': 'O1',
     'EXG8': 'O2',
+
+    # =========================================================================
+    # PSG (Polysomnography) with prefix: PSG_F3 -> F3, etc.
+    # =========================================================================
+    'PSG_F3': 'F3',
+    'PSG_F4': 'F4',
+    'PSG_C3': 'C3',
+    'PSG_C4': 'C4',
+    'PSG_O1': 'O1',
+    'PSG_O2': 'O2',
+    'PSG_FP1': 'FP1',
+    'PSG_FP2': 'FP2',
+    'PSG_FZ': 'FZ',
+    'PSG_CZ': 'CZ',
+    'PSG_PZ': 'PZ',
+    'PSG_OZ': 'OZ',
+    'PSG_T3': 'T7',
+    'PSG_T4': 'T8',
+    'PSG_T5': 'P7',
+    'PSG_T6': 'P8',
+    # EOG/EMG channels are not EEG - no mapping (will be skipped)
+
+    # =========================================================================
+    # Generic headband devices (2-4 channel forehead EEG)
+    # Assumes left-right forehead placement
+    # =========================================================================
+    'HB_1': 'AF7',   # Headband channel 1 -> left forehead
+    'HB_2': 'AF8',   # Headband channel 2 -> right forehead
+    'HB_3': 'FP1',   # Headband channel 3 -> left frontal pole
+    'HB_4': 'FP2',   # Headband channel 4 -> right frontal pole
+    'HEADBAND_L': 'AF7',
+    'HEADBAND_R': 'AF8',
+    'FOREHEAD_L': 'AF7',
+    'FOREHEAD_R': 'AF8',
+    'FRONT_L': 'AF7',
+    'FRONT_R': 'AF8',
+
+    # =========================================================================
+    # Dreem headband: 5 dry electrodes on forehead/back of head
+    # =========================================================================
+    'F7_DREEM': 'F7',
+    'F8_DREEM': 'F8',
+    'FPZ_DREEM': 'FPZ',
+    'O1_DREEM': 'O1',
+    'O2_DREEM': 'O2',
+
+    # =========================================================================
+    # EASYCAP Equidistant Cap (ds004460 Spot Rotation dataset)
+    # Auto-generated mapping based on 3D electrode coordinates
+    # NOTE: R1-R32 mappings CONFLICT with cEEGrid R1-R8. If using this dataset,
+    # you may need to comment out the cEEGrid R* mappings above.
+    # Only G, W, Y channels are included here to avoid conflicts.
+    # =========================================================================
+    # G (Green) group - right anterior/lateral
+    'G1': 'FP2',
+    'G2': 'FP2',
+    'G3': 'FP2',
+    'G4': 'AF4',
+    'G5': 'FP2',
+    'G6': 'FP2',
+    'G7': 'AF8',
+    'G8': 'AF4',
+    'G9': 'AF8',
+    'G10': 'F8',
+    'G11': 'F8',
+    'G12': 'FT8',
+    'G14': 'T8',
+    'G15': 'T8',
+    'G16': 'FT10',
+    'G17': 'T8',
+    'G18': 'T10',
+    'G19': 'TP8',
+    'G20': 'TP8',
+    'G21': 'P8',
+    'G22': 'P8',
+    'G23': 'PO8',
+    'G24': 'P6',
+    'G25': 'PO8',
+    'G26': 'PO8',
+    'G27': 'M2',
+    'G28': 'PO4',
+    'G29': 'PO4',
+    'G30': 'O2',
+    'G31': 'O2',
+    'G32': 'M2',
+    # W (White) group - left hemisphere
+    'W1': 'FP1',
+    'W2': 'AF7',
+    'W3': 'FC5',
+    'W4': 'FP1',
+    'W5': 'AF3',
+    'W6': 'AF3',
+    'W7': 'FC5',
+    'W8': 'FC5',
+    'W9': 'FC5',
+    'W10': 'AF3',
+    'W11': 'F3',
+    'W12': 'F3',
+    'W13': 'FC3',
+    'W14': 'FC3',
+    'W15': 'C3',
+    'W16': 'C3',
+    'W17': 'C3',
+    'W18': 'C3',
+    'W19': 'CP3',
+    'W20': 'P3',
+    'W21': 'PO3',
+    'W22': 'C5',
+    'W23': 'C5',
+    'W24': 'CP5',
+    'W25': 'P5',
+    'W26': 'P5',
+    'W27': 'PO3',
+    'W28': 'C5',
+    'W29': 'CP5',
+    'W30': 'P7',
+    'W31': 'P7',
+    'W32': 'PO7',
+    # Y (Yellow) group - right posterior/central
+    'Y1': 'AF4',
+    'Y2': 'F4',
+    'Y5': 'AF4',
+    'Y6': 'F4',
+    'Y7': 'FC4',
+    'Y19': 'C4',
+    'Y20': 'C4',
+    'Y22': 'CP6',
+    'Y23': 'P6',
+    'Y24': 'C4',
+    'Y25': 'CP4',
+    'Y26': 'P4',
+    'Y27': 'P4',
+    'Y28': 'C2',
+    'Y29': 'C2',
+    'Y30': 'CP2',
+    'Y31': 'P4',
+    'Y32': 'P2',
 }
 
 LOGGER = logging.getLogger("labram.inference")
@@ -243,7 +380,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-level",
         type=str,
-        default="DEBUG",
+        default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
@@ -304,6 +441,7 @@ def load_model(
     LOGGER.info(f"Loading model {model_name} from {checkpoint_path}")
 
     # Create model without classification head (num_classes=0 makes head Identity)
+    # init_values=0.1 enables LayerScale (gamma_1/gamma_2) to match pretrained checkpoint
     model = create_model(
         model_name,
         pretrained=False,
@@ -311,6 +449,7 @@ def load_model(
         drop_rate=0.0,
         drop_path_rate=0.0,
         use_mean_pooling=True,
+        init_values=0.1,  # Enable LayerScale to match pretrained weights
     )
 
     # Load checkpoint
@@ -325,21 +464,30 @@ def load_model(
         state_dict = checkpoint
 
     # Strip 'student.' prefix if present (from pretraining)
+    # Also remap keys for architecture differences
     new_state_dict = {}
     for k, v in state_dict.items():
         if k.startswith("student."):
             k = k[8:]  # Remove 'student.' prefix
-        # Skip classification head weights
-        if k.startswith("head."):
+        # Skip pretraining-specific weights
+        if k.startswith(("head.", "lm_head.", "projection_head.")):
             continue
+        if k in ("mask_token", "logit_scale"):
+            continue
+        # Remap norm -> fc_norm for mean pooling mode
+        if k in ("norm.weight", "norm.bias"):
+            k = k.replace("norm.", "fc_norm.")
         new_state_dict[k] = v
 
     # Load weights (allow missing keys for removed head)
     missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
     if missing:
-        LOGGER.debug(f"Missing keys: {missing}")
+        # Filter out expected missing keys (head removed for feature extraction)
+        missing = [k for k in missing if not k.startswith("head.")]
+        if missing:
+            LOGGER.warning(f"Missing keys (may affect model quality): {missing}")
     if unexpected:
-        LOGGER.debug(f"Unexpected keys: {unexpected}")
+        LOGGER.warning(f"Unexpected keys in checkpoint: {unexpected}")
 
     model.to(device)
     model.eval()

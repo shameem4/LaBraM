@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from timm.layers.weight_init import trunc_normal_
-from timm.models.registry import register_model
+from timm.models import register_model
 
 from modeling_finetune import Block, _cfg
 

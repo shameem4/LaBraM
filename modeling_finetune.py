@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from timm.layers.drop import drop_path
 from timm.layers.helpers import to_2tuple
 from timm.layers.weight_init import trunc_normal_
-from timm.models.registry import register_model
+from timm.models import register_model
 from einops import rearrange
 
 

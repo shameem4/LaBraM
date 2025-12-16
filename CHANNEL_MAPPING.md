@@ -134,6 +134,54 @@ When OpenBCI channels aren't configured with proper names, they use EXG1-8. This
 
 ---
 
+## PSG (Polysomnography) Prefixed Channels
+
+Some PSG systems prefix channel names with "PSG_":
+
+| PSG Name | 10-20 |
+|----------|-------|
+| PSG_F3 | F3 |
+| PSG_F4 | F4 |
+| PSG_C3 | C3 |
+| PSG_C4 | C4 |
+| PSG_O1 | O1 |
+| PSG_O2 | O2 |
+| PSG_FP1 | FP1 |
+| PSG_FP2 | FP2 |
+| PSG_FZ | FZ |
+| PSG_CZ | CZ |
+
+**Note**: PSG_EOG and PSG_EMG channels are not EEG and will be skipped.
+
+---
+
+## Generic Headband Devices
+
+2-4 channel forehead EEG headbands:
+
+| Headband | 10-20 | Notes |
+|----------|-------|-------|
+| HB_1 | AF7 | Left forehead |
+| HB_2 | AF8 | Right forehead |
+| HB_3 | FP1 | Left frontal pole (if 4-channel) |
+| HB_4 | FP2 | Right frontal pole (if 4-channel) |
+
+---
+
+## Dreem Headband
+
+5-channel dry electrode sleep headband:
+
+| Dreem | 10-20 |
+|-------|-------|
+| F7_DREEM | F7 |
+| F8_DREEM | F8 |
+| FPZ_DREEM | FPZ |
+| O1_DREEM | O1 |
+| O2_DREEM | O2 |
+
+---
+
 ## Legacy 10-20 Names
 
 Older 10-20 naming conventions are mapped to modern equivalents:
@@ -189,6 +237,50 @@ Guidelines for choosing mappings:
 2. Choose the nearest standard 10-20 position
 3. When in doubt, prefer temporal positions (T7/T8/T9/T10) for ear-adjacent electrodes
 4. Document your rationale in comments
+
+---
+
+## EASYCAP Equidistant Cap (ds004460 Spot Rotation dataset)
+
+Mappings for high-density equidistant electrode caps have been auto-generated using `map_equidistant_to_1020.py`, which matches electrode 3D coordinates to nearest standard 10-20 positions.
+
+**Dataset details:**
+- 157 channels: G01-G32, Y01-Y32, R01-R32, W01-W32, N01-N32
+- Channel names are amplifier group labels (Green, Yellow, Red, White, Neck)
+- Electrodes placed in equidistant pattern, mapped to closest 10-20 positions
+
+**Channel groups:**
+
+| Group | Prefix | Hemisphere | Mapped Regions |
+|-------|--------|------------|----------------|
+| Green | G1-G32 | Right | FP2, AF4, AF8, F8, T8, P8, O2, M2 |
+| White | W1-W32 | Left | FP1, AF3, AF7, F3, FC3, C3, P3, O1 |
+| Yellow | Y1-Y32 | Right central | F4, FC4, C4, CP4, P4, P2 |
+| Red | R1-R32 | Midline | AFZ, FZ, CZ, PZ, POZ |
+| Neck | N1-N32 | - | Not mapped (excluded) |
+
+**Known conflict:** R1-R8 from the equidistant cap conflict with cEEGrid R1-R8 mappings (around-the-ear electrodes). The equidistant R channels are NOT included in the default aliases. If processing ds004460 data, you have two options:
+
+1. **Comment out cEEGrid R mappings**: Edit `run_labram_inference.py` and comment out `'R1': 'FT10'` through `'R8': 'M2'`, then add:
+
+   ```python
+   # ds004460 R (Red) group - midline
+   'R1': 'AFZ', 'R2': 'AFZ', 'R3': 'AFZ', 'R4': 'FZ', 'R5': 'F3',
+   'R6': 'FZ', 'R7': 'FZ', 'R8': 'FZ', 'R9': 'FC1', 'R10': 'F4',
+   'R11': 'FZ', 'R12': 'FCZ', 'R13': 'CZ', 'R14': 'FC2', 'R15': 'FCZ',
+   'R16': 'CZ', 'R17': 'CZ', 'R18': 'CP2', 'R19': 'CZ', 'R20': 'CPZ',
+   'R21': 'P2', 'R22': 'P2', 'R23': 'C1', 'R24': 'C1', 'R25': 'CP1',
+   'R26': 'P1', 'R27': 'PZ', 'R28': 'CP3', 'R29': 'P1', 'R30': 'P1',
+   'R31': 'POZ', 'R32': 'POZ',
+   ```
+
+2. **Rename channels in preprocessing**: Rename R channels in your HDF5 to use a different prefix (e.g., `RED1`, `RED2`, etc.)
+
+**Generating custom mappings:** Use `map_equidistant_to_1020.py` with subject-specific electrode coordinates:
+
+```bash
+python map_equidistant_to_1020.py --electrodes path/to/electrodes.tsv --max-distance 50
+```
 
 ---
 
