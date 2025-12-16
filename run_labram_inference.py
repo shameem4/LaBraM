@@ -148,13 +148,15 @@ def get_input_chans(ch_names: List[str]) -> tuple[List[int], List[int], List[str
 
     for i, ch_name in enumerate(ch_names):
         ch_upper = ch_name.upper()
+        # Strip reference notation (e.g., "C4:A1" -> "C4", "O2-A1" -> "O2")
+        ch_base = ch_upper.split(':')[0].split('-')[0].strip()
         try:
-            idx = STANDARD_1020.index(ch_upper) + 1
+            idx = STANDARD_1020.index(ch_base) + 1
             input_chans.append(idx)
             valid_eeg_indices.append(i)
             valid_ch_names.append(ch_name)
         except ValueError:
-            LOGGER.debug(f"Channel '{ch_name}' not in standard 10-20 montage, skipping")
+            LOGGER.debug(f"Channel '{ch_name}' (base: '{ch_base}') not in standard 10-20 montage, skipping")
 
     return input_chans, valid_eeg_indices, valid_ch_names
 
