@@ -6,7 +6,7 @@ when planning training, fine-tuning, or deployment changes.
 
 ## End-to-End Data & Training Flow
 
-```
+```text
 Raw EEG (EDF/BDF/CNT ...)
    │
    ├─► dataset_maker/*.py  → HDF5 shards aligned to LaBraM conventions
@@ -36,7 +36,7 @@ Raw EEG (EDF/BDF/CNT ...)
 
 ## End-to-End Inference / Deployment Flow
 
-```
+```text
 Raw EEG stream or archives (EDF/BDF/CNT, sensor packets)
    │
    ├─► Lightweight preprocessing
@@ -68,6 +68,7 @@ Raw EEG stream or archives (EDF/BDF/CNT, sensor packets)
 ```
 
 ### Control Signals & Decisions
+
 1. **Argument parsing (run_*.py):** CLI flags define hardware, dataset, and
    model hyperparameters. Each script builds models via `timm.create_model()`
    and data pipelines before delegating to its engine.
@@ -82,23 +83,27 @@ Raw EEG stream or archives (EDF/BDF/CNT, sensor packets)
 
 ## File Guide
 
-| File / Folder | Purpose |
-| --- | --- |
-| run_vqnsp_training.py | CLI entry point for tokenizer training, builds datasets and launches `engine_for_vqnsp`.
-| engine_for_vqnsp.py | Training / eval loops for the VQ-NSP tokenizer, including codebook usage reporting.
-| modeling_vqnsp.py | Defines the `VQNSP` encoder-decoder, quantizer wiring, and `register_model` factory for timm.
-| run_labram_pretraining.py | MEM pre-training launcher: loads tokenizer checkpoint, builds multi-montage datasets, configures optimizer + schedulers.
-| engine_for_pretraining.py | Implements random masking, teacher-token generation, loss accumulation, AMP, and gradient accumulation for MEM.
-| modeling_pretrain.py | Contains `NeuralTransformerForMEM` plus helper modules (TemporalConv, PatchEmbed). Outputs masked token predictions.
-| run_class_finetuning.py | Downstream fine-tuning/eval entry. Handles dataset-specific metrics, optimizer grouping, EMA, and checkpoint loading.
-| engine_for_finetuning.py | Batches training/eval steps for classification or regression heads with mixup-ready hooks.
-| modeling_finetune.py | Core Transformer encoder used for tokenizer decoder, MEM, and downstream heads. Includes attention blocks, embeddings, and classifier head.
-| utils.py | Shared helpers for distributed setup, dataset prep (TUAB/TUEV + generic), schedulers, metric logging, and checkpoint utilities.
-| optim_factory.py | Optimizer constructors, parameter grouping (layer-wise lr decay), and custom schedulers.
-| norm_ema_quantizer.py | EMA-based vector quantizer used by VQ-NSP to maintain the neural codebook.
-| data_processor/ | Dataset definitions (`dataset.py`, preprocessing scripts) used by `utils.prepare_*`.
-| dataset_maker/ | Raw-to-HDF5 conversion scripts (per dataset) plus shared EEG utilities for filtering & buffering.
-| checkpoints/ | Default location for pretrained and tokenizer weights referenced by scripts.
+<!-- markdownlint-disable MD013 -->
+
+| File / Folder              | Purpose                                                      |
+| -------------------------- | ------------------------------------------------------------ |
+| run_vqnsp_training.py      | CLI entry point for tokenizer training                       |
+| engine_for_vqnsp.py        | Training/eval loops for VQ-NSP tokenizer                     |
+| modeling_vqnsp.py          | VQNSP encoder-decoder and quantizer wiring                   |
+| run_labram_pretraining.py  | MEM pre-training launcher with tokenizer checkpoint          |
+| engine_for_pretraining.py  | Random masking, teacher-token generation, AMP for MEM        |
+| modeling_pretrain.py       | NeuralTransformerForMEM with TemporalConv, PatchEmbed        |
+| run_class_finetuning.py    | Downstream fine-tuning/eval entry point                      |
+| engine_for_finetuning.py   | Training/eval steps for classification/regression heads      |
+| modeling_finetune.py       | Core Transformer encoder with attention and classifier head  |
+| utils.py                   | Distributed setup, dataset prep, schedulers, checkpoint I/O  |
+| optim_factory.py           | Optimizer constructors and parameter grouping                |
+| norm_ema_quantizer.py      | EMA-based vector quantizer for VQ-NSP codebook               |
+| data_processor/            | Dataset definitions and preprocessing scripts                |
+| dataset_maker/             | Raw-to-HDF5 conversion scripts and EEG utilities             |
+| checkpoints/               | Default location for pretrained weights                      |
+
+<!-- markdownlint-enable MD013 -->
 
 ## Working With the Flow
 

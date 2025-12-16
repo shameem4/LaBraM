@@ -60,13 +60,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input", "-i",
         type=Path,
-        default=Path("d:/neuro_datasets/derivatives/labram_bids.h5"),
+        default=Path("d:/neuro_datasets/derivatives/labram_bids.hdf5"),
         help="Input HDF5 file created by make_bids_h5dataset.py",
     )
     parser.add_argument(
         "--output", "-o",
         type=Path,
-        default=Path("labram_bids_outputs.h5"),
+        default=Path("d:/neuro_datasets/derivatives/labram_bids_outputs.hdf5"),
         help="Output HDF5 file for storing LaBraM features",
     )
     parser.add_argument(
@@ -109,8 +109,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-inputs",
         action="store_true",
-        default=True,
-        help="Also save the input EEG windows (default: True)",
+        default=False,
+        help="Also save the input EEG windows (default: off)",
     )
     parser.add_argument(
         "--no-save-inputs",
@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        default=False,
+        default=True,
         help="Overwrite output file if it exists",
     )
     parser.add_argument(
@@ -134,17 +134,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def get_input_chans(ch_names: List[str]) -> List[int]:
-    """Map channel names to standard 10-20 positions for LaBraM."""
+def get_input_chans(ch_names: List[str]) -> tuple[List[int], List[int], List[str]]:
+    """Map channel names to standard 10-20 positions for LaBraM.
+
+    Returns:
+        input_chans: Position embedding indices (starts with 0 for CLS token)
+        valid_eeg_indices: Indices into the original EEG array for valid channels
+        valid_ch_names: Names of valid channels
+    """
     input_chans = [0]  # CLS token position
-    for ch_name in ch_names:
+    valid_eeg_indices: List[int] = []
+    valid_ch_names: List[str] = []
+
+    for i, ch_name in enumerate(ch_names):
         ch_upper = ch_name.upper()
         try:
             idx = STANDARD_1020.index(ch_upper) + 1
             input_chans.append(idx)
+            valid_eeg_indices.append(i)
+            valid_ch_names.append(ch_name)
         except ValueError:
-            LOGGER.warning(f"Channel '{ch_name}' not in standard 10-20 montage, skipping")
-    return input_chans
+            LOGGER.debug(f"Channel '{ch_name}' not in standard 10-20 montage, skipping")
+
+    return input_chans, valid_eeg_indices, valid_ch_names
 
 
 def load_model(
@@ -324,6 +336,10 @@ def main():
 
             for rec_name in tqdm(recording_names, desc="Processing recordings"):
                 grp = h5_in[rec_name]
+                if not isinstance(grp, h5py.Group):
+                    LOGGER.warning(f"Skipping {rec_name}: not a group")
+                    skipped += 1
+                    continue
 
                 if "eeg" not in grp:
                     LOGGER.warning(f"Skipping {rec_name}: no 'eeg' dataset")
@@ -331,18 +347,31 @@ def main():
                     continue
 
                 eeg_dset = grp["eeg"]
-                eeg_data = eeg_dset[:]
+                if not isinstance(eeg_dset, h5py.Dataset):
+                    LOGGER.warning(f"Skipping {rec_name}: 'eeg' is not a dataset")
+                    skipped += 1
+                    continue
+
+                eeg_data: np.ndarray = eeg_dset[:]
 
                 # Get channel order
+                ch_order: List[str]
                 if "chOrder" in eeg_dset.attrs:
-                    ch_order = [ch.decode() if isinstance(ch, bytes) else ch
-                               for ch in eeg_dset.attrs["chOrder"]]
+                    ch_order_raw = eeg_dset.attrs["chOrder"]
+                    try:
+                        # h5py attrs can return Empty type, handled by except
+                        ch_order_list = list(ch_order_raw)  # pyright: ignore[reportArgumentType]
+                        ch_order = [ch.decode() if isinstance(ch, bytes) else str(ch)
+                                   for ch in ch_order_list]
+                    except TypeError:
+                        LOGGER.warning(f"Invalid channel order for {rec_name}, using default indices")
+                        ch_order = [f"CH{i}" for i in range(eeg_data.shape[0])]
                 else:
                     LOGGER.warning(f"No channel order for {rec_name}, using default indices")
                     ch_order = [f"CH{i}" for i in range(eeg_data.shape[0])]
 
-                # Get input channel mapping
-                input_chans = get_input_chans(ch_order)
+                # Get input channel mapping and filter to valid channels
+                input_chans, valid_eeg_indices, valid_ch_names = get_input_chans(ch_order)
 
                 # Check if we have enough valid channels
                 if len(input_chans) < 2:  # Only CLS token
@@ -350,9 +379,12 @@ def main():
                     skipped += 1
                     continue
 
-                # Extract windows
+                # Filter EEG data to only include valid channels
+                eeg_data_filtered = eeg_data[valid_eeg_indices, :]
+
+                # Extract windows from filtered data
                 windows = extract_windows(
-                    eeg_data,
+                    eeg_data_filtered,
                     window_size=args.window_size,
                     stride=args.stride,
                 )
@@ -395,10 +427,11 @@ def main():
 
                 # Save metadata
                 out_grp.attrs["num_windows"] = len(windows)
-                out_grp.attrs["num_channels"] = len(ch_order)
-                out_grp.attrs["ch_order"] = ch_order
+                out_grp.attrs["num_channels"] = len(valid_ch_names)
+                out_grp.attrs["ch_order"] = valid_ch_names
                 out_grp.attrs["input_chans"] = input_chans
-                out_grp.attrs["original_samples"] = eeg_data.shape[1]
+                out_grp.attrs["original_samples"] = int(eeg_data.shape[1])
+                out_grp.attrs["original_num_channels"] = len(ch_order)
 
                 # Copy over source attributes if present
                 if "source_bids_path" in eeg_dset.attrs:
