@@ -573,10 +573,11 @@ def main():
     LOGGER.info(f"Training complete. Final model saved to {args.output}")
     LOGGER.info(f"Best val_loss: {best_val_loss:.4f}")
 
-    # Save training history
+    # Save training history (convert Path objects to strings for JSON serialization)
+    args_dict = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     with open(args.output.with_suffix('.json'), 'w') as f:
         json.dump({
-            'args': vars(args),
+            'args': args_dict,
             'history': history,
             'best_val_loss': best_val_loss,
         }, f, indent=2)
